@@ -145,17 +145,25 @@ def get_songs_in_folder(songs_dir=None):
 # ------------------------------------------------------------
 # Beatmap cache (predetermined for demo/example, progress bar)
 # ------------------------------------------------------------
-def get_cache_path(media_path):
+def get_cache_path(media_path, difficulty="easy"):
     try:
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
     except: pass
-    # use stem + hash to avoid collisions
+    stem = Path(media_path).stem
+    h = hashlib.md5(str(Path(media_path).resolve()).encode()).hexdigest()[:8]
+    diff = str(difficulty).lower() if difficulty else "easy"
+    if diff not in ("easy","hard"):
+        diff = "easy"
+    return CACHE_DIR / f"{stem}_{h}_{diff}.json"
+
+def _legacy_cache_path(media_path):
+    # previous version without difficulty suffix (v2)
     stem = Path(media_path).stem
     h = hashlib.md5(str(Path(media_path).resolve()).encode()).hexdigest()[:8]
     return CACHE_DIR / f"{stem}_{h}.json"
 
-def load_cached_beatmap(media_path, sensitivity=1.0):
-    cp = get_cache_path(media_path)
+def load_cached_beatmap(media_path, sensitivity=1.0, difficulty="easy"):
+    cp = get_cache_path(media_path, difficulty)
     if not cp.exists():
         return None
     try:
@@ -170,6 +178,11 @@ def load_cached_beatmap(media_path, sensitivity=1.0):
             return None
         if abs(data.get('sensitivity', 1.0) - sensitivity) > 0.01:
             return None
+        # difficulty check for v3 caches
+        if data.get('version', 2) >= 3:
+            cached_diff = str(data.get('difficulty','easy')).lower()
+            if cached_diff != str(difficulty).lower():
+                return None
         bm = data.get('beatmap', [])
         duration = data.get('duration', 30.0)
         tempo = data.get('tempo', 120.0)
@@ -180,17 +193,18 @@ def load_cached_beatmap(media_path, sensitivity=1.0):
         print(f"[cache] load failed {e}")
         return None
 
-def save_cached_beatmap(media_path, beatmap, duration, tempo, sensitivity=1.0):
+def save_cached_beatmap(media_path, beatmap, duration, tempo, sensitivity=1.0, difficulty="easy"):
     try:
-        cp = get_cache_path(media_path)
+        cp = get_cache_path(media_path, difficulty)
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
         data = {
             'beatmap': [[float(t), str(lane)] for t, lane in beatmap],
             'duration': float(duration),
             'tempo': float(tempo),
             'sensitivity': float(sensitivity),
+            'difficulty': str(difficulty).lower(),
             'mtime': Path(media_path).stat().st_mtime if Path(media_path).exists() else 0,
-            'version': 2
+            'version': 3
         }
         with open(cp, 'w', encoding='utf-8') as f:
             json.dump(data, f)
@@ -427,11 +441,11 @@ def detect_beats_sfx(sr, audio, sensitivity=1.0, progress_cb=None):
     prog(1.0)
     return [float(t) for t in beats], float(bpm)
 
-def detect_beats_madmom(sr, audio, sensitivity=1.0, progress_cb=None):
-    """madmom RNN onset detection - sparse *main-beat* mode.
-    Targets melody/voice (playable density ~1.0-1.6/s) instead of every
-    16th.  Sensitivity still maps to density for future difficulty:
-    0.5=very sparse, 1.0=normal (playable), 2.0=dense.
+def detect_beats_madmom(sr, audio, sensitivity=1.0, difficulty="easy", voice_focus=True, progress_cb=None):
+    """madmom RNN onset detection with voice/melody focus.
+    * Easy*: sparse main beats (~1.45/s) filtered to most voice-like.
+    * Hard*: dense (~3.0/s) but still voice-biased.
+    Both use dense pool + voice-ratio selection so melody/voice dominate.
     Returns (beat_times, tempo)."""
     import numpy as _np
     from madmom.features.onsets import RNNOnsetProcessor, OnsetPeakPickingProcessor
@@ -439,27 +453,70 @@ def detect_beats_madmom(sr, audio, sensitivity=1.0, progress_cb=None):
         if progress_cb:
             try: progress_cb(v)
             except: pass
-    s = max(0.2, min(2.0, float(sensitivity)))
-    # sparse main-beat params: higher threshold + larger combine + larger min_gap
-    # at s=1.0 -> th~0.55, comb~0.28, mg~0.38  => ~1.3/s (tested)
-    # at s=2.0 -> th~0.30, comb~0.10, mg~0.18 => ~3-4/s (dense for hard)
-    threshold = float(0.80 - 0.25 * s)          # 0.55 @1.0, 0.30 @2.0
-    threshold = max(0.28, min(0.75, threshold))
-    combine = float(0.40 - 0.12 * s)           # 0.28 @1.0, 0.16 @2.0
-    combine = max(0.05, min(0.40, combine))
-    min_gap = float(0.52 - 0.14 * s)           # 0.38 @1.0, 0.24 @2.0
-    min_gap = max(0.14, min(0.50, min_gap))
     prog(0.1)
     acts = RNNOnsetProcessor()(audio.astype(_np.float32, copy=False), sample_rate=sr)
-    prog(0.8)
-    peak = OnsetPeakPickingProcessor(threshold=threshold, combine=combine, fps=100)
-    beats = [float(t) for t in peak(acts)]
-    kept = []
-    for t in beats:
-        if not kept or t - kept[-1] >= min_gap:
-            kept.append(t)
-    beats = kept
-    # estimate musical tempo via spectral-flux autocorrelation (not note density)
+    prog(0.6)
+    # dense pool - low threshold to capture many candidates (incl. voice)
+    # sensitivity fine-tunes pool slightly: higher s -> lower threshold
+    s = max(0.2, min(2.0, float(sensitivity)))
+    pool_thr = float(0.38 - 0.04*s)  # 0.34 @1.0, 0.30 @2.0
+    pool_thr = max(0.28, min(0.45, pool_thr))
+    pool_comb = 0.10
+    pool_mg = 0.12
+    peak = OnsetPeakPickingProcessor(threshold=pool_thr, combine=pool_comb, fps=100)
+    pool = [float(t) for t in peak(acts)]
+    # pool min_gap
+    tmp = []
+    for t in pool:
+        if not tmp or t - tmp[-1] >= pool_mg:
+            tmp.append(t)
+    pool = tmp
+    prog(0.75)
+    dur = len(audio)/float(sr) if sr else 30.0
+    difficulty = str(difficulty).lower() if difficulty else "easy"
+    if difficulty not in ("easy","hard"):
+        difficulty = "easy"
+    # target densities: easy ~1.45/s, hard ~3.0/s  (tuned vs 1.49/3.59 pools)
+    if difficulty == "hard":
+        target_n = int(round(dur * 3.0))
+        min_gap = 0.20
+        # hard keeps most of pool but still voice-biased (drop lowest voice 15%)
+        # if pool very dense, keep up to target
+        if voice_focus and len(pool) > 10:
+            beats = _select_voice_focused(pool, sr, audio, target_n, min_gap)
+        else:
+            # no voice filter: just enforce gap
+            kept=[]
+            for t in pool:
+                if not kept or t-kept[-1] >= min_gap:
+                    kept.append(t)
+            beats = kept[:target_n] if len(kept)>target_n else kept
+    else: # easy
+        target_n = int(round(dur * 1.45))
+        min_gap = 0.38
+        if voice_focus and len(pool) > 10:
+            beats = _select_voice_focused(pool, sr, audio, target_n, min_gap)
+        else:
+            # fallback sparse without voice
+            kept=[]
+            for t in pool:
+                if not kept or t-kept[-1] >= min_gap:
+                    kept.append(t)
+            # if still too many, thin by taking every other by threshold
+            if len(kept) > target_n*1.3:
+                # keep most energetic: use acts magnitude
+                # simple: sort by act value
+                vals = []
+                for t in kept:
+                    idx = int(round(t*100))
+                    idx = max(0, min(len(acts)-1, idx))
+                    vals.append(float(acts[idx]))
+                order = np.argsort(np.array(vals))[::-1]
+                sel = sorted([kept[i] for i in order[:target_n]])
+                beats = sel
+            else:
+                beats = kept[:target_n] if len(kept)>target_n else kept
+    # tempo
     bpm = 120.0
     try:
         _flux = onset_envelope_sfx(sr, audio, hop=512)
@@ -469,7 +526,98 @@ def detect_beats_madmom(sr, audio, sensitivity=1.0, progress_cb=None):
     except Exception:
         bpm = 120.0
     prog(1.0)
-    return beats, float(bpm)
+    return [float(t) for t in beats], float(bpm)
+
+def _voice_ratio_for_time(t, sr, audio):
+    """Voice band energy ratio 150-4000 Hz vs total - proxy for voice/melody presence."""
+    try:
+        N = 2048
+        c = int(t*sr)
+        half = 1024
+        n = len(audio)
+        lo = max(0, c-half)
+        hi = min(n, c+half)
+        win = audio[lo:hi]
+        if len(win) < 256:
+            return 0.0
+        if len(win) < N:
+            win = np.pad(win, (0, N-len(win)))
+        else:
+            win = win[:N]
+        w = np.hanning(N).astype(np.float32)
+        spec = np.abs(np.fft.rfft((win*w).astype(np.float32)))
+        freqs = np.fft.rfftfreq(N, 1.0/sr)
+        mask = (freqs >= 150) & (freqs <= 4000)
+        tot = float(np.sum(spec) + 1e-9)
+        return float(np.sum(spec[mask]) / tot)
+    except:
+        return 0.0
+
+def _select_voice_focused(times, sr, audio, target_n, min_gap):
+    """From dense pool, keep most voice-like beats respecting min_gap.
+    Greedy by voice score (highest first)."""
+    if not times or target_n <= 0:
+        return []
+    if len(times) <= target_n and min_gap <= 0.12:
+        return sorted(times)
+    # score each time
+    scores = []
+    for t in times:
+        vr = _voice_ratio_for_time(t, sr, audio)
+        # combine with tonality (1-flat) to prefer harmonic
+        # compute flatness quickly for same window
+        try:
+            N = 2048
+            c = int(t*sr)
+            half = 1024
+            n = len(audio)
+            lo = max(0, c-half); hi = min(n, c+half)
+            win = audio[lo:hi]
+            if len(win) < N:
+                win = np.pad(win, (0, N-len(win)))
+            else:
+                win = win[:N]
+            w = np.hanning(N).astype(np.float32)
+            spec = np.abs(np.fft.rfft((win*w).astype(np.float32)))
+            spec = np.maximum(spec, 1e-8)
+            gm = float(np.exp(np.mean(np.log(spec))))
+            am = float(np.mean(spec))
+            flat = gm/am if am>0 else 1.0
+            tonal = max(0.0, 1.0-flat)
+            score = vr * (0.6 + 0.4*tonal)
+        except:
+            score = vr
+        scores.append(score)
+    order = np.argsort(np.array(scores))[::-1]  # most voice first
+    selected = []
+    for idx in order:
+        t = float(times[idx])
+        # gap check vs already selected
+        ok = True
+        for s in selected:
+            if abs(t - s) < min_gap - 1e-6:
+                ok = False
+                break
+        if ok:
+            selected.append(t)
+            if len(selected) >= target_n:
+                break
+    selected = sorted(selected)
+    # if we still under target (gaps too strict), fill with next best that least violates
+    if len(selected) < min(target_n, len(times)):
+        # second pass: allow closer but penalize
+        for idx in order:
+            t = float(times[idx])
+            if t in selected:
+                continue
+            # find closest selected
+            closest = min(abs(t-s) for s in selected) if selected else 1e9
+            if closest >= min_gap*0.65:  # allow slightly closer
+                selected.append(t)
+                selected = sorted(selected)
+                if len(selected) >= target_n:
+                    break
+    return sorted(selected[:target_n])
 
 def _centroids_for_times(times, sr, audio):
     """Spectral centroid per onset (pitch proxy). Returns list[float]."""
@@ -569,7 +717,7 @@ def beatmap_from_times(times, duration, sr=None, audio=None):
         prev = best_lane
     return sorted(beatmap, key=lambda x: x[0])
 
-def beats_from_media(media_path, sensitivity=1.0, use_librosa=True, progress_cb=None):
+def beats_from_media(media_path, difficulty="easy", sensitivity=1.0, use_librosa=True, progress_cb=None):
     def prog(v):
         if progress_cb:
             try:
@@ -642,6 +790,7 @@ def beats_from_media(media_path, sensitivity=1.0, use_librosa=True, progress_cb=
             import madmom
             prog(0.4)
             madmom_times, _bpm = detect_beats_madmom(sr_read, audio, sensitivity=sensitivity,
+                difficulty=difficulty, voice_focus=True,
                 progress_cb=lambda p: prog(0.4 + 0.32*p))
             if len(madmom_times) < 8:
                 madmom_times = None
@@ -781,6 +930,10 @@ class RhythmGame(pyglet.window.Window):
         self.media_path = None
         self.sensitivity = 1.0
         self.beat_offset = 0.0  # manual sync offset (seconds) - ,/. to adjust
+        self.difficulty = "easy"
+        self.difficulty_index = 0
+        self.difficulty_options = ["EASY", "HARD"]
+        self.pending_song_path = None
 
         # scoring
         self.score = 0
@@ -1056,9 +1209,9 @@ class RhythmGame(pyglet.window.Window):
         self.analysis_progress = 1.0
         # save cache for next time (predetermined)
         try:
-            save_cached_beatmap(path, beatmap, duration, tempo, self.sensitivity)
+            save_cached_beatmap(path, beatmap, duration, tempo, self.sensitivity, self.difficulty)
         except: pass
-        self.feedback_text = f"Ready: {len(beatmap)} beats | ENTER to play | tempo ~{int(tempo)}"
+        self.feedback_text = f"Ready [{self.difficulty.upper()}]: {len(beatmap)} beats | ENTER to play | tempo ~{int(tempo)}"
         self.feedback_color = (100, 255, 150, 255)
         self.feedback_time = time.time()
         self.is_media_mode = False
@@ -1069,13 +1222,13 @@ class RhythmGame(pyglet.window.Window):
             # stay in song_select/menu but show ready
             self.state = "song_select" if self.song_files else "menu"
 
-    def _analysis_thread_func(self, path, sensitivity, autoplay):
+    def _analysis_thread_func(self, path, sensitivity, difficulty, autoplay):
         # runs in background thread - set flag, main thread picks up in update()
         try:
             def prog_cb(p):
                 self.analysis_progress = max(0.0, min(1.0, p))
-                self.analysis_msg = f"Analysing {Path(path).name} {int(p*100)}%"
-            beatmap, duration, tempo = beats_from_media(path, sensitivity=sensitivity, use_librosa=False, progress_cb=prog_cb)
+                self.analysis_msg = f"Analysing {Path(path).name} [{difficulty.upper()}] {int(p*100)}%"
+            beatmap, duration, tempo = beats_from_media(path, difficulty=difficulty, sensitivity=sensitivity, use_librosa=False, progress_cb=prog_cb)
             self._analysis_result = (beatmap, duration, tempo)
             self._analysis_error = None
             self._analysis_autoplay = autoplay
@@ -1099,20 +1252,22 @@ class RhythmGame(pyglet.window.Window):
     def _stop_av_thread(self):
         pass
 
-    def load_media(self, path, autoplay=False):
+    def load_media(self, path, difficulty=None, autoplay=False):
+        if difficulty is None:
+            difficulty = self.difficulty
+        difficulty = str(difficulty).lower()
+        if difficulty not in ("easy","hard"):
+            difficulty = "easy"
+        self.difficulty = difficulty
         if not os.path.exists(path):
             self.feedback_text = f"File not found: {path}"
             self.feedback_color = (255, 80, 80, 255)
             self.feedback_time = time.time()
             return
         # check cache first (predetermined for demo/example)
-        # special predetermined for _example_beats.wav - if no cache, create one instantly
         p = Path(path)
-        if p.name == "_example_beats.wav" and not get_cache_path(path).exists():
-            # predetermined: use known click track at ~128bpm (the file we generated)
-            # we know its duration ~20s and beats every 0.468s, just use generate pattern
+        if p.name == "_example_beats.wav" and not get_cache_path(path, difficulty).exists():
             try:
-                # try to get duration via pyglet or assume 20
                 dur = 20.0
                 try:
                     import wave
@@ -1120,28 +1275,24 @@ class RhythmGame(pyglet.window.Window):
                         dur = wf.getnframes() / wf.getframerate()
                 except:
                     pass
-                # generate a 128bpm grid that matches the click track for instant
                 bpm = 128
                 interval = 60.0 / bpm
-                # use actual detection for this file is 44 beats, but we can mimic
-                # for predetermined, use simple 4-lane cycle
                 beatmap = [(i*interval, LANE_ORDER[i%4]) for i in range(int(dur/interval))]
-                # save as cache so next time is also instant
-                save_cached_beatmap(path, beatmap, dur, bpm, self.sensitivity)
-                print(f"[predetermined] _example_beats.wav -> {len(beatmap)} beats (instant)")
+                save_cached_beatmap(path, beatmap, dur, bpm, self.sensitivity, difficulty)
+                print(f"[predetermined] _example_beats.wav [{difficulty}] -> {len(beatmap)} beats (instant)")
             except Exception as e:
                 print(f"[predetermined] failed {e}")
 
-        cached = load_cached_beatmap(path, sensitivity=self.sensitivity)
+        cached = load_cached_beatmap(path, sensitivity=self.sensitivity, difficulty=difficulty)
         if cached:
             beatmap, duration, tempo = cached
-            print(f"[cache] hit {Path(path).name} -> {len(beatmap)} beats (instant)")
+            print(f"[cache] hit {Path(path).name} [{difficulty}] -> {len(beatmap)} beats (instant)")
             self.beatmap = beatmap
             self.duration = duration
             self.media_path = path
             self._prepare_media_player(path)
             self.reset_play_state()
-            self.feedback_text = f"Ready (cached): {len(beatmap)} beats | ENTER to play"
+            self.feedback_text = f"Ready (cached) [{difficulty.upper()}]: {len(beatmap)} beats | ENTER to play"
             self.feedback_color = (100, 255, 150, 255)
             self.feedback_time = time.time()
             self.is_media_mode = False
@@ -1153,7 +1304,7 @@ class RhythmGame(pyglet.window.Window):
         # not cached -> need analysis with progress bar
         self.media_path = path
         self.analysis_progress = 0.0
-        self.analysis_msg = f"Analysing {Path(path).name} ..."
+        self.analysis_msg = f"Analysing {Path(path).name} [{difficulty.upper()}] ..."
         self.feedback_text = self.analysis_msg
         self.feedback_color = (255, 220, 100, 255)
         self.feedback_time = time.time()
@@ -1164,9 +1315,9 @@ class RhythmGame(pyglet.window.Window):
         self._analysis_path = path
         self._analysis_autoplay = autoplay
         self._pending_autoplay = autoplay
-        print(f"[load] analysing {path} sensitivity={self.sensitivity} (threaded)")
+        print(f"[load] analysing {path} [{self.difficulty}] sensitivity={self.sensitivity} (threaded)")
         # start thread
-        t = threading.Thread(target=self._analysis_thread_func, args=(path, self.sensitivity, autoplay), daemon=True)
+        t = threading.Thread(target=self._analysis_thread_func, args=(path, self.sensitivity, self.difficulty, autoplay), daemon=True)
         t.start()
 
     def start_media(self):
@@ -1243,8 +1394,8 @@ class RhythmGame(pyglet.window.Window):
                 self._analysis_result = None
                 self._analysis_error = None
                 return
-            # keep song count fresh in menu/song_select (without IO every frame)
-            if self.state in ("menu", "song_select"):
+            # keep song count fresh in menu/song_select/difficulty_select
+            if self.state in ("menu", "song_select", "difficulty_select"):
                 if not hasattr(self, '_last_refresh') or time.time() - self._last_refresh > 1.5:
                     self.song_files = get_songs_in_folder()
                     self._last_refresh = time.time()
@@ -1430,7 +1581,9 @@ class RhythmGame(pyglet.window.Window):
             if symbol in (key.ENTER, key.SPACE, key.NUM_ENTER):
                 if self.song_files:
                     chosen = self.song_files[self.song_index]
-                    self.load_media(str(chosen), autoplay=True)
+                    self.pending_song_path = str(chosen)
+                    self.difficulty_index = 0 if self.difficulty=="easy" else 1
+                    self.state = "difficulty_select"
                 else:
                     self.feedback_text = "No songs - add files to songs/ folder"
                     self.feedback_color = (255,180,80,255)
@@ -1447,7 +1600,39 @@ class RhythmGame(pyglet.window.Window):
                 return
             if symbol == key.P and self.song_files:
                 chosen = self.song_files[self.song_index]
-                self.load_media(str(chosen), autoplay=True)
+                self.pending_song_path = str(chosen)
+                self.difficulty_index = 0 if self.difficulty=="easy" else 1
+                self.state = "difficulty_select"
+                return
+
+        elif self.state == "difficulty_select":
+            if symbol in (key.UP, key.W, key.LEFT, key.A):
+                self.difficulty_index = (self.difficulty_index - 1) % len(self.difficulty_options)
+                self.difficulty = self.difficulty_options[self.difficulty_index].lower()
+                return
+            if symbol in (key.DOWN, key.S, key.RIGHT, key.D):
+                self.difficulty_index = (self.difficulty_index + 1) % len(self.difficulty_options)
+                self.difficulty = self.difficulty_options[self.difficulty_index].lower()
+                return
+            if symbol in (key.ENTER, key.SPACE, key.NUM_ENTER):
+                if self.pending_song_path:
+                    diff = self.difficulty_options[self.difficulty_index].lower()
+                    self.difficulty = diff
+                    self.load_media(self.pending_song_path, difficulty=diff, autoplay=True)
+                return
+            if symbol in (key.ESCAPE, key.B):
+                self.state = "song_select"
+                return
+            # number keys quick select
+            if symbol == key._1:
+                self.difficulty = "easy"; self.difficulty_index=0
+                if self.pending_song_path:
+                    self.load_media(self.pending_song_path, difficulty="easy", autoplay=True)
+                return
+            if symbol == key._2:
+                self.difficulty = "hard"; self.difficulty_index=1
+                if self.pending_song_path:
+                    self.load_media(self.pending_song_path, difficulty="hard", autoplay=True)
                 return
 
         elif self.state == "analyzing":
@@ -2169,6 +2354,52 @@ class RhythmGame(pyglet.window.Window):
                 self._draw_label(f"{self.song_index+1} / {len(self.song_files)}", x=panel_x+16, y=panel_y+14, size=9, color=(120,140,170,255), anchor_x='left', anchor_y='center', font_name='Consolas')
                 self._draw_label("ENTER play  •  UP/DOWN navigate", x=panel_x+panel_w//2, y=panel_y+14, size=9, color=(120,140,170,255), anchor_x='center', anchor_y='center', font_name='Consolas')
             # feedback line at bottom
+            if self.feedback_text and (time.time() - self.feedback_time) < 3.0:
+                age = time.time() - self.feedback_time
+                alpha = int(180 * (1 - age/3.0))
+                self._draw_label(self.feedback_text, x=WINDOW_W//2, y=60, size=10, color=(*self.feedback_color[:3], max(0,alpha)), anchor_x='center', anchor_y='center', font_name='Consolas')
+            return
+
+        if self.state == "difficulty_select":
+            self._draw_label("CHOOSE DIFFICULTY", x=WINDOW_W//2, y=WINDOW_H - 70, size=26, color=(255,255,255,255), anchor_x='center', anchor_y='center', weight='bold')
+            song_name = Path(self.pending_song_path).name if self.pending_song_path else "Unknown"
+            if len(song_name) > 55:
+                song_name = song_name[:52] + "..."
+            self._draw_label(song_name, x=WINDOW_W//2, y=WINDOW_H - 105, size=11, color=(140,200,255,255), anchor_x='center', anchor_y='center', font_name='Consolas')
+            # panel
+            panel_x, panel_y, panel_w, panel_h = 320, 180, 640, 340
+            panel = pyglet.shapes.Rectangle(panel_x, panel_y, panel_w, panel_h, color=(18,18,30))
+            panel.draw()
+            # options
+            for idx, opt in enumerate(self.difficulty_options):
+                y = 380 - idx*110
+                selected = idx == self.difficulty_index
+                # box
+                box = pyglet.shapes.Rectangle(panel_x+30, y-45, panel_w-60, 90, color=(55,55,90) if selected else (28,28,42))
+                box.draw()
+                if selected:
+                    border = pyglet.shapes.Rectangle(panel_x+30-1, y-46, panel_w-58, 92, color=(100,255,160))
+                    # draw border as outline (behind box, so need to draw before box - simple: draw accent bar)
+                    accent = pyglet.shapes.Rectangle(panel_x+30, y-45, 6, 90, color=(100,255,160))
+                    accent.draw()
+                # label
+                col = (255,255,140,255) if selected else (220,220,240,255)
+                self._draw_label(opt, x=panel_x+60, y=y+10, size=18, color=(*col[:3],255), anchor_x='left', anchor_y='center', weight='bold')
+                desc = "melody & voice • ~1.5/s • playable" if opt=="EASY" else "melody & voice • ~3.0/s • dense challenge"
+                dcol = (180,255,180,255) if selected else (160,160,190,255)
+                self._draw_label(desc, x=panel_x+60, y=y-18, size=9, color=(*dcol[:3],255), anchor_x='left', anchor_y='center', font_name='Consolas')
+                # beats preview if cached
+                try:
+                    p = self.pending_song_path
+                    if p:
+                        cp = get_cache_path(p, opt.lower())
+                        if cp.exists():
+                            import json as _js
+                            d=_js.load(open(cp,encoding='utf-8'))
+                            self._draw_label(f"{len(d.get('beatmap',[]))} beats cached", x=panel_x+panel_w-40, y=y, size=9, color=(120,200,120,255), anchor_x='right', anchor_y='center', font_name='Consolas')
+                except:
+                    pass
+            self._draw_label("UP/DOWN choose • ENTER confirm • 1/2 quick • ESC back", x=WINDOW_W//2, y=panel_y+14, size=9, color=(120,140,170,255), anchor_x='center', anchor_y='center', font_name='Consolas')
             if self.feedback_text and (time.time() - self.feedback_time) < 3.0:
                 age = time.time() - self.feedback_time
                 alpha = int(180 * (1 - age/3.0))
