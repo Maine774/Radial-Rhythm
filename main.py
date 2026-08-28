@@ -25,18 +25,31 @@ import subprocess
 import wave
 import threading
 import hashlib
-import queue
+import ctypes
 from pathlib import Path
+
+# Find bundled FFmpeg shared DLLs so pyglet can decode mp4 natively.
+# If present, prepend its bin dir to PATH *before* pyglet imports its ffmpeg bindings.
+_BUNDLED_FFMPEG_BIN = None
+for _d in [Path(__file__).parent / "ffmpeg_shared", Path(__file__).resolve().parent / "ffmpeg_shared"]:
+    if _d.is_dir():
+        for _sub in sorted(_d.iterdir(), reverse=True):
+            if (_sub / "bin").is_dir() and any((_sub / "bin").glob("avcodec-*.dll")):
+                _BUNDLED_FFMPEG_BIN = str(_sub / "bin")
+                break
+        if _BUNDLED_FFMPEG_BIN:
+            break
+if _BUNDLED_FFMPEG_BIN:
+    os.environ["PATH"] = _BUNDLED_FFMPEG_BIN + os.pathsep + os.environ.get("PATH", "")
+    os.environ["PYGLET_FFMPEG_LOCATION"] = _BUNDLED_FFMPEG_BIN
+    try:
+        ctypes.windll.kernel32.SetDllDirectoryW(_BUNDLED_FFMPEG_BIN)
+    except Exception:
+        pass
 
 import pyglet
 from pyglet.window import key
 import numpy as np
-try:
-    import av
-    HAS_AV = True
-except:
-    HAS_AV = False
-    av = None
 
 # ------------------------------------------------------------
 # Config
@@ -271,6 +284,187 @@ def detect_beats_energy(sr, audio, sensitivity=1.0, progress_cb=None):
     times = [p * hop / sr for p in peaks]
     return times
 
+def onset_envelope_sfx(sr, audio, hop=512, n_fft=1024):
+    """Onset strength envelope via spectral flux (log-compressed, half-wave rectified)."""
+    audio = audio.astype(np.float32)
+    peak = np.max(np.abs(audio))
+    if peak > 0:
+        audio = audio / peak * 0.99
+    n_frames = 1 + (len(audio) - n_fft) // hop
+    if n_frames <= 4:
+        return np.zeros(4)
+    window = np.hanning(n_fft).astype(np.float32)
+    n_freq = n_fft // 2 + 1
+    spec = np.empty((n_frames, n_freq), dtype=np.float32)
+    for i in range(n_frames):
+        start = i * hop
+        frame = audio[start:start + n_fft]
+        if len(frame) < n_fft:
+            frame = np.pad(frame, (0, n_fft - len(frame)))
+        spec[i] = np.abs(np.fft.rfft(frame * window))
+    spec = np.log1p(spec * 50.0)
+    diff = spec[1:] - spec[:-1]
+    diff[diff < 0] = 0
+    flux = np.sum(diff, axis=1)
+    flux = np.concatenate([[0.0], flux])
+    k = 3
+    kernel = np.ones(k) / k
+    flux = np.convolve(flux, kernel, mode='same')
+    return flux
+
+def estimate_tempo_autocorr(sr, flux, hop=512, bpm_min=55, bpm_max=200):
+    """Tempo via autocorrelation of onset envelope, preferring higher tempos (smallest strong lag)."""
+    fps = sr / hop
+    ac = np.correlate(flux, flux, mode='full')
+    ac = ac[len(flux)-1:]
+    if ac[0] > 0:
+        ac = ac / (ac[0] + 1e-6)
+    lag_min = int(fps * 60.0 / bpm_max)
+    lag_max = int(fps * 60.0 / bpm_min)
+    if lag_max + 1 > len(ac):
+        lag_max = len(ac) // 2 - 1
+    if lag_max <= lag_min:
+        return 120.0, int(fps * 60.0 / 120.0)
+    region = ac[lag_min:lag_max]
+    thresh = 0.45 * np.max(region)
+    best_lag = lag_min
+    best_val = -1
+    for lag in range(lag_min, min(lag_max, len(ac))):
+        v = ac[lag]
+        lo = max(lag_min, lag - 4)
+        hi = min(lag_max, lag + 5)
+        if v < np.max(ac[lo:hi]):
+            continue
+        if v > thresh and v > best_val:
+            best_val = v
+            best_lag = lag
+    while best_lag // 2 >= lag_min:
+        half = best_lag // 2
+        if ac[half] >= 0.85 * best_val:
+            best_lag = half
+            best_val = ac[half]
+        else:
+            break
+    bpm = 60.0 * fps / best_lag
+    return bpm, best_lag
+
+def dp_beat_track(flux, fps, bpm):
+    """Ellis-style dynamic-programming beat tracking. Returns beat times in seconds."""
+    n = len(flux)
+    if n < 10:
+        return []
+    beat_interval = max(4.0, fps / (bpm / 60.0))
+    dp_score = np.zeros(n)
+    backlink = -np.ones(n, dtype=int)
+    i0 = int(beat_interval)
+    for s in range(i0):
+        dp_score[s] = flux[s]
+    for s in range(i0, n):
+        lo = max(1, int(s - 2 * beat_interval))
+        hi = max(lo + 2, int(s - beat_interval / 2))
+        window = dp_score[lo:hi]
+        k = int(np.argmax(window))
+        best_p = lo + k
+        expected = s - beat_interval
+        penalty = abs(best_p - expected) / beat_interval
+        penalty = 0.05 * penalty * penalty
+        dp_score[s] = flux[s] + window[k] * (1.0 / (1.0 + penalty))
+        backlink[s] = best_p
+    tail_start = max(0, n - int(3 * beat_interval))
+    end_idx = int(np.argmax(dp_score[tail_start:])) + tail_start
+    beats = []
+    cur = end_idx
+    guard = 0
+    while cur > 0 and backlink[cur] >= 0 and guard < n:
+        guard += 1
+        beats.append(cur)
+        nxt = backlink[cur]
+        if nxt >= cur:
+            break
+        cur = nxt
+    if not beats:
+        beats = [end_idx]
+    beats.reverse()
+    refined = []
+    for b in beats:
+        lo = max(1, b - 3)
+        hi = min(n - 1, b + 3)
+        window = flux[lo:hi + 1]
+        b_local = int(np.argmax(window)) + lo
+        if not refined or b_local - refined[-1] >= int(beat_interval * 0.25):
+            refined.append(b_local)
+    times = [r / fps for r in refined]
+    return times
+
+def detect_beats_sfx(sr, audio, sensitivity=1.0, progress_cb=None):
+    """Improved beat detection: spectral flux onset envelope + autocorrelation tempo + DP tracking.
+    Returns (beat_times, bpm)."""
+    hop = 512
+    def prog(v):
+        if progress_cb:
+            try: progress_cb(v)
+            except: pass
+    prog(0.05)
+    flux = onset_envelope_sfx(sr, audio, hop=hop)
+    prog(0.35)
+    bpm, _ = estimate_tempo_autocorr(sr, flux, hop=hop)
+    prog(0.5)
+    beats = dp_beat_track(flux, sr / hop, bpm)
+    prog(0.8)
+    if len(beats) < 8:
+        # fallback: strong peaks from flux
+        peaks = np.argsort(flux)[::-1]
+        min_dist = int(0.2 * sr / hop)
+        sel = []
+        last = -min_dist
+        for p in peaks:
+            if p - last >= min_dist:
+                sel.append(p)
+                last = p
+            if len(sel) >= 100:
+                break
+        beats = sorted(s / (sr / hop) for s in sel)
+    prog(1.0)
+    return [float(t) for t in beats], float(bpm)
+
+def detect_beats_madmom(sr, audio, progress_cb=None):
+    """madmom RNN + DBN beat tracking (state of the art, slow).
+    Returns (beat_times, tempo)."""
+    import numpy as _np
+    from madmom.features.beats import RNNBeatProcessor, DBNBeatTrackingProcessor
+    def prog(v):
+        if progress_cb:
+            try: progress_cb(v)
+            except: pass
+    prog(0.1)
+    acts = RNNBeatProcessor()(audio.astype(_np.float32, copy=False), sample_rate=sr)
+    prog(0.8)
+    dec = DBNBeatTrackingProcessor(fps=100)
+    beats = dec(acts)
+    # estimate tempo from beat intervals
+    bpm = 120.0
+    if len(beats) > 4:
+        gaps = _np.diff(beats)
+        gaps = gaps[gaps > 0.1]
+        if len(gaps) > 2:
+            med = float(_np.median(gaps))
+            if med > 0:
+                bpm = 60.0 / med
+                # if detecting half-time, double if > 30 bpm below typical
+    prog(1.0)
+    return [float(t) for t in beats], float(bpm)
+
+def beatmap_from_times(times, duration):
+    """Build lane-assigned beatmap from a sorted list of beat times."""
+    beatmap = []
+    for idx, t in enumerate(times):
+        lane = LANE_ORDER[idx % 4]
+        beatmap.append((float(t), lane))
+        if idx % 16 == 7 and idx+1 < len(times) and times[idx+1] - t > 0.4:
+            other = LANE_ORDER[(LANE_ORDER.index(lane)+2)%4]
+            beatmap.append((float(t), other))
+    return sorted(beatmap, key=lambda x: x[0])
+
 def beats_from_media(media_path, sensitivity=1.0, use_librosa=True, progress_cb=None):
     def prog(v):
         if progress_cb:
@@ -283,7 +477,19 @@ def beats_from_media(media_path, sensitivity=1.0, use_librosa=True, progress_cb=
         try:
             import librosa
             prog(0.1)
-            y, sr = librosa.load(str(media_path), sr=22050, mono=True)
+            # for video, extract wav first for better librosa support (mp4 often fails direct)
+            temp_wav = None
+            try:
+                if Path(media_path).suffix.lower() in {".mp4", ".m4v", ".mov", ".avi", ".mkv", ".webm"}:
+                    temp_wav = tempfile.NamedTemporaryFile(delete=False, suffix='.wav').name
+                    extract_wav_with_ffmpeg(media_path, temp_wav, sr=22050)
+                    y, sr = librosa.load(temp_wav, sr=22050, mono=True)
+                else:
+                    y, sr = librosa.load(str(media_path), sr=22050, mono=True)
+            finally:
+                if temp_wav and os.path.exists(temp_wav):
+                    try: os.unlink(temp_wav)
+                    except: pass
             prog(0.35)
             tempo, beat_frames = librosa.beat.beat_track(y=y, sr=sr, units='time')
             prog(0.55)
@@ -307,6 +513,7 @@ def beats_from_media(media_path, sensitivity=1.0, use_librosa=True, progress_cb=
                     lane = LANE_ORDER[idx % 4]
                 lane_pattern.append((float(t), lane))
             prog(1.0)
+            lane_pattern = fill_beat_gaps(lane_pattern, float(duration), float(tempo) if hasattr(tempo, '__float__') else 120.0)
             return lane_pattern, float(duration), float(tempo) if hasattr(tempo, '__float__') else 120.0
         except ImportError:
             pass
@@ -325,26 +532,35 @@ def beats_from_media(media_path, sensitivity=1.0, use_librosa=True, progress_cb=
             os.unlink(wav_path)
         except: pass
         duration = len(audio) / sr_read
-        prog(0.42)
-        times = detect_beats_energy(sr_read, audio, sensitivity=sensitivity, progress_cb=lambda p: prog(0.42 + 0.4*p))
+        # madmom preferred when installed (most accurate beat tracking)
+        madmom_times = None
+        try:
+            import madmom
+            prog(0.4)
+            madmom_times, _bpm = detect_beats_madmom(sr_read, audio,
+                progress_cb=lambda p: prog(0.4 + 0.32*p))
+            if len(madmom_times) < 8:
+                madmom_times = None
+        except Exception as e:
+            print(f"[madmom] unavailable ({e}), using numpy detector")
+            madmom_times = None
+        if madmom_times is not None:
+            times = madmom_times
+            detected_bpm = 60.0 / (float(np.median(np.diff(np.array(times)))) if len(times) > 4 else 0.5)
+        else:
+            prog(0.42)
+            times, detected_bpm = detect_beats_sfx(sr_read, audio, sensitivity=sensitivity, progress_cb=lambda p: prog(0.42 + 0.4*p))
         if len(times) < 8:
             print("[detect] too few onsets, generating BPM grid")
             bpm = 128
             beat_interval = 60.0 / bpm
             times = [i * beat_interval for i in range(int(duration / beat_interval))]
-        beatmap = []
-        for idx, t in enumerate(times):
-            # cycle lanes to ensure all 4 colours appear (D F J K)
-            lane = LANE_ORDER[idx % 4]
-            beatmap.append((float(t), lane))
-            if idx % 16 == 7 and idx+1 < len(times) and times[idx+1] - t > 0.4:
-                other = LANE_ORDER[(LANE_ORDER.index(lane)+2)%4]
-                beatmap.append((float(t), other))
-        beatmap = sorted(beatmap, key=lambda x: x[0])
+        beatmap = beatmap_from_times(times, duration)
+        beatmap = fill_beat_gaps(beatmap, float(duration), detected_bpm)
         prog(0.92)
         # also handle librosa return prog
         prog(1.0)
-        return beatmap, float(duration), 120.0
+        return beatmap, float(duration), detected_bpm
     except Exception as e:
         print(f"[ffmpeg/numpy] beat detection failed: {e}")
         try:
@@ -357,6 +573,67 @@ def beats_from_media(media_path, sensitivity=1.0, use_librosa=True, progress_cb=
         interval = 60.0/bpm
         beatmap = [(i*interval, LANE_ORDER[i%4]) for i in range(int(duration/interval))]
         return beatmap, duration, bpm
+
+def fill_beat_gaps(beatmap, duration, tempo_hint=120):
+    """Fill large gaps (>1.6x avg interval) with interpolated beats so no silent sections."""
+    if not beatmap:
+        return beatmap
+    # estimate avg interval from median
+    import numpy as np
+    times = [t for t,_ in beatmap]
+    if len(times) < 2:
+        return beatmap
+    intervals = [times[i+1]-times[i] for i in range(len(times)-1)]
+    # use median for robustness
+    try:
+        avg = float(np.median(intervals))
+    except:
+        avg = 60.0/tempo_hint if tempo_hint>0 else 0.5
+    if avg < 0.2: avg = 0.4
+    if avg > 1.0: avg = 0.6
+    filled = []
+    for i in range(len(beatmap)):
+        filled.append(beatmap[i])
+        if i+1 < len(beatmap):
+            gap = beatmap[i+1][0] - beatmap[i][0]
+            if gap > avg*1.7 and gap < 4.0:
+                # fill gap with regular beats
+                n_fill = int(round(gap/avg)) - 1
+                if n_fill > 0 and n_fill < 8:
+                    for k in range(1, n_fill+1):
+                        t = beatmap[i][0] + avg*k
+                        # don't go too close to next
+                        if t < beatmap[i+1][0] - 0.12:
+                            lane = LANE_ORDER[(i+k) % 4]
+                            filled.append((t, lane))
+        elif beatmap[i][0] < duration - avg:
+            # tail gap to end
+            gap = duration - beatmap[i][0]
+            if gap > avg*1.7:
+                n_fill = int(round(gap/avg)) - 1
+                for k in range(1, min(n_fill+1, 6)):
+                    t = beatmap[i][0] + avg*k
+                    if t < duration - 0.1:
+                        lane = LANE_ORDER[(i+k) % 4]
+                        filled.append((t, lane))
+    filled = sorted(filled, key=lambda x: x[0])
+    # dedup close
+    dedup = []
+    for t,l in filled:
+        if dedup and abs(t-dedup[-1][0]) < 0.09:
+            continue
+        dedup.append((t,l))
+    # if still sparse (< 0.8 beats per sec), add grid
+    if len(dedup) < duration*0.8:
+        # fallback: add 2 beats per sec grid where gaps
+        grid = []
+        for i in range(int(duration*2)):
+            t = i*0.5
+            # check if already close to existing
+            if not any(abs(t-existing[0]) < 0.22 for existing in dedup):
+                grid.append((t, LANE_ORDER[i%4]))
+        dedup = sorted(dedup+grid, key=lambda x: x[0])
+    return dedup
 
 # ------------------------------------------------------------
 # Game Window
@@ -393,6 +670,7 @@ class RhythmGame(pyglet.window.Window):
         self.media_source = None
         self.media_path = None
         self.sensitivity = 1.0
+        self.beat_offset = 0.0  # manual sync offset (seconds) - ,/. to adjust
 
         # scoring
         self.score = 0
@@ -534,15 +812,8 @@ class RhythmGame(pyglet.window.Window):
         # video background sprite (for MP4)
         self._video_sprite = None
         self._av_container = None
-        self._av_video_stream = None
-        self._av_frame_iter = None
         self._av_last_frame_image = None
         self._temp_audio_wav = None
-        self._av_frame_queue = queue.Queue(maxsize=4)
-        self._av_thread = None
-        self._av_thread_stop = threading.Event()
-        self._av_lock = threading.Lock()
-        self._av_latest_pts = 0.0
         self.analysis_progress = 0.0
         self.analysis_msg = ""
         self._analysis_done = False
@@ -626,15 +897,12 @@ class RhythmGame(pyglet.window.Window):
 
     def _prepare_media_player(self, path):
         # (re)create pyglet player for video/audio playback
-        # also setup AV video for mp4 background if needed
-        # cleanup previous av
+        # Cleanup previous ffmpeg source / av video objects
         if getattr(self, '_av_container', None):
             try:
                 self._av_container.close()
             except: pass
             self._av_container = None
-            self._av_video_stream = None
-            self._av_frame_iter = None
             self._av_last_frame_image = None
         if getattr(self, '_temp_audio_wav', None) and os.path.exists(self._temp_audio_wav):
             try:
@@ -653,51 +921,9 @@ class RhythmGame(pyglet.window.Window):
             self._video_sprite = None
             has_video = bool(getattr(self.media_source, 'video_format', None))
             print(f"[media] loaded duration {self.media_source.duration} (has video: {has_video})")
-            # if has video and HAS_AV, also setup av for more reliable video background
-            if has_video and HAS_AV:
-                try:
-                    self._av_container = av.open(str(path))
-                    for s in self._av_container.streams:
-                        if s.type == 'video':
-                            self._av_video_stream = s
-                            break
-                    if self._av_video_stream:
-                        print(f"[video] av fallback ready {self._av_video_stream.width}x{self._av_video_stream.height}")
-                except Exception as ve:
-                    print(f"[video] av setup failed {ve}")
             return True
         except Exception as e:
             print(f"[media] pyglet load failed: {e}")
-            # fallback for video files: extract audio + setup av video
-            if HAS_AV and Path(path).suffix.lower() in {".mp4", ".m4v", ".mov", ".avi", ".mkv", ".webm"}:
-                try:
-                    # extract audio to temp wav for playback
-                    tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.wav')
-                    tmp.close()
-                    print(f"[media] extracting audio for fallback {tmp.name}")
-                    extract_wav_with_ffmpeg(path, tmp.name, sr=44100)
-                    self.media_source = pyglet.media.load(tmp.name, streaming=True)
-                    self.media_player = pyglet.media.Player()
-                    self.media_player.queue(self.media_source)
-                    self._temp_audio_wav = tmp.name
-                    self._video_sprite = None
-                    print(f"[media] fallback audio loaded {tmp.name} duration {self.media_source.duration}")
-                    # setup av video
-                    try:
-                        self._av_container = av.open(str(path))
-                        for s in self._av_container.streams:
-                            if s.type == 'video':
-                                self._av_video_stream = s
-                                break
-                        if self._av_video_stream:
-                            print(f"[video] av video {self._av_video_stream.width}x{self._av_video_stream.height}")
-                    except Exception as ve:
-                        print(f"[video] av failed {ve}")
-                    return True
-                except Exception as fe:
-                    print(f"[media] fallback failed {fe}")
-                    import traceback
-                    traceback.print_exc()
             self.media_source = None
             self.media_player = None
             return False
@@ -739,7 +965,7 @@ class RhythmGame(pyglet.window.Window):
             def prog_cb(p):
                 self.analysis_progress = max(0.0, min(1.0, p))
                 self.analysis_msg = f"Analysing {Path(path).name} {int(p*100)}%"
-            beatmap, duration, tempo = beats_from_media(path, sensitivity=sensitivity, use_librosa=True, progress_cb=prog_cb)
+            beatmap, duration, tempo = beats_from_media(path, sensitivity=sensitivity, use_librosa=False, progress_cb=prog_cb)
             self._analysis_result = (beatmap, duration, tempo)
             self._analysis_error = None
             self._analysis_autoplay = autoplay
@@ -754,76 +980,14 @@ class RhythmGame(pyglet.window.Window):
             self._analysis_autoplay = False
 
     def _av_thread_func(self):
-        # background thread: decode video at 30fps, push to queue
-        try:
-            if not self._av_container or not self._av_video_stream:
-                # try to find stream
-                if self._av_container:
-                    for s in self._av_container.streams:
-                        if s.type == 'video':
-                            self._av_video_stream = s
-                            break
-                if not self._av_video_stream:
-                    return
-            # seek to start
-            try:
-                self._av_container.seek(0)
-            except: pass
-            frame_iter = self._av_container.decode(video=0)
-            while not self._av_thread_stop.is_set() and self.is_playing and self.is_media_mode:
-                try:
-                    frame = next(frame_iter)
-                    # scale to 320 for perf
-                    if frame.width > 320:
-                        try:
-                            h = int(320 * frame.height / frame.width)
-                            frame = frame.reformat(width=320, height=h, format='rgb24')
-                        except:
-                            pass
-                    arr = frame.to_ndarray(format='rgb24')
-                    pts = float(frame.pts * self._av_video_stream.time_base) if frame.pts is not None else 0
-                    # put in queue, drop oldest if full
-                    try:
-                        if self._av_frame_queue.full():
-                            try:
-                                self._av_frame_queue.get_nowait()
-                            except: pass
-                        self._av_frame_queue.put_nowait((arr, frame.width, frame.height, pts))
-                    except:
-                        pass
-                    # pace to ~30fps
-                    time.sleep(1/30.0)
-                except StopIteration:
-                    # loop video
-                    try:
-                        self._av_container.seek(0)
-                        frame_iter = self._av_container.decode(video=0)
-                    except:
-                        break
-                except Exception as e:
-                    time.sleep(0.02)
-                    continue
-        except Exception as e:
-            print(f"[av thread] {e}")
+        # (removed - pyglet FFmpeg provides synced video via player.texture)
+        pass
 
     def _start_av_thread(self):
-        self._stop_av_thread()
-        self._av_thread_stop.clear()
-        while not self._av_frame_queue.empty():
-            try:
-                self._av_frame_queue.get_nowait()
-            except: pass
-        self._av_thread = threading.Thread(target=self._av_thread_func, daemon=True)
-        self._av_thread.start()
+        pass
 
     def _stop_av_thread(self):
-        try:
-            self._av_thread_stop.set()
-        except: pass
-        try:
-            while not self._av_frame_queue.empty():
-                self._av_frame_queue.get_nowait()
-        except: pass
+        pass
 
     def load_media(self, path, autoplay=False):
         if not os.path.exists(path):
@@ -913,11 +1077,7 @@ class RhythmGame(pyglet.window.Window):
                 self.start_time = time.time()
             except Exception as e:
                 print(f"player play failed {e}")
-        # start AV video thread for 30fps background
-        if getattr(self, '_av_container', None) and getattr(self, '_av_video_stream', None):
-            self._av_last_frame_image = None
-            self._video_sprite = None
-            self._start_av_thread()
+        # (video background handled by player.texture in on_draw - FFmpeg syncs it to audio)
         self.feedback_text = "PLAYING"
         self.feedback_color = (74, 255, 138, 255)
         self.feedback_time = time.time()
@@ -938,11 +1098,12 @@ class RhythmGame(pyglet.window.Window):
     def spawn_beats(self, song_t):
         while self.next_index < len(self.beatmap):
             bt, lane = self.beatmap[self.next_index]
-            if bt - song_t <= TRAVEL_TIME + 0.05:
-                if bt >= song_t - HIT_WINDOW_OK:
+            bt_eff = bt + self.beat_offset
+            if bt_eff - song_t <= TRAVEL_TIME + 0.05:
+                if bt_eff >= song_t - HIT_WINDOW_OK:
                     ang = LANES[lane]['angle']
                     self.active_beats.append({
-                        'time': bt,
+                        'time': bt_eff,
                         'lane': lane,
                         'angle': ang,
                         'hit': False,
@@ -981,78 +1142,6 @@ class RhythmGame(pyglet.window.Window):
         if not self.is_playing:
             return
         song_t = self.get_song_time()
-        # update AV video from background thread (30fps) - main thread only does texture upload
-        if getattr(self, '_av_container', None) and self.is_media_mode and self.is_playing:
-            try:
-                latest = None
-                while not self._av_frame_queue.empty():
-                    try:
-                        latest = self._av_frame_queue.get_nowait()
-                    except:
-                        break
-                if latest is not None:
-                    arr, w, h, pts = latest
-                    img = pyglet.image.ImageData(w, h, 'RGB', arr.tobytes(), pitch=-w*3)
-                    self._av_last_frame_image = img.get_texture()
-            except:
-                pass
-        elif getattr(self, '_av_thread', None) and self._av_thread.is_alive():
-            self._stop_av_thread()
-        # legacy disabled
-        if False and getattr(self, '_av_container', None) and getattr(self, '_av_video_stream', None) and self.is_media_mode:
-            try:
-                if not hasattr(self, '_av_last_video_time'):
-                    self._av_last_video_time = -999
-                if song_t - self._av_last_video_time >= 1/30.0:
-        if getattr(self, '_av_container', None) and getattr(self, '_av_video_stream', None) and self.is_media_mode:
-            try:
-                if not hasattr(self, '_av_last_video_time'):
-                    self._av_last_video_time = -999
-                if song_t - self._av_last_video_time >= 1/30.0:
-                    if self._av_frame_iter is None:
-                        try:
-                            self._av_container.seek(0)
-                        except: pass
-                        try:
-                            self._av_frame_iter = self._av_container.decode(video=0)
-                        except:
-                            self._av_frame_iter = None
-                    if self._av_frame_iter is not None:
-                        try:
-                            frame = next(self._av_frame_iter)
-                            # scale down to 160 for 30fps perf (16x faster than 1280)
-                            if frame.width > 160:
-                                try:
-                                    # keep aspect
-                                    h = int(160 * frame.height / frame.width)
-                                    frame = frame.reformat(width=160, height=h, format='rgb24')
-                                except:
-                                    pass
-                            arr = frame.to_ndarray(format='rgb24')
-                            img = pyglet.image.ImageData(frame.width, frame.height, 'RGB', arr.tobytes(), pitch=-frame.width*3)
-                            self._av_last_frame_image = img.get_texture()
-                            self._av_last_video_time = song_t
-                        except StopIteration:
-                            try:
-                                self._av_container.seek(0)
-                                self._av_frame_iter = self._av_container.decode(video=0)
-                                frame = next(self._av_frame_iter)
-                                if frame.width > 160:
-                                    try:
-                                        h = int(160 * frame.height / frame.width)
-                                        frame = frame.reformat(width=160, height=h, format='rgb24')
-                                    except:
-                                        pass
-                                arr = frame.to_ndarray(format='rgb24')
-                                img = pyglet.image.ImageData(frame.width, frame.height, 'RGB', arr.tobytes(), pitch=-frame.width*3)
-                                self._av_last_frame_image = img.get_texture()
-                                self._av_last_video_time = song_t
-                            except:
-                                pass
-                        except:
-                            pass
-            except:
-                pass
         self.spawn_beats(song_t)
         still_active = []
         for b in self.active_beats:
@@ -1316,6 +1405,18 @@ class RhythmGame(pyglet.window.Window):
                 self.sensitivity = min(2.0, self.sensitivity + 0.1)
                 self.feedback_text = f"Sensitivity {self.sensitivity:.1f}"
                 self.feedback_color = (200,220,255,255)
+                self.feedback_time = time.time()
+                return
+            if symbol == key.COMMA:
+                self.beat_offset = max(-0.5, self.beat_offset - 0.05)
+                self.feedback_text = f"Offset {self.beat_offset:+.2f}s (earlier)"
+                self.feedback_color = (180, 220, 255, 255)
+                self.feedback_time = time.time()
+                return
+            if symbol == key.PERIOD:
+                self.beat_offset = min(0.5, self.beat_offset + 0.05)
+                self.feedback_text = f"Offset {self.beat_offset:+.2f}s (later)"
+                self.feedback_color = (180, 220, 255, 255)
                 self.feedback_time = time.time()
                 return
             if symbol in KEY_TO_LANE:
@@ -1654,41 +1755,7 @@ class RhythmGame(pyglet.window.Window):
     # Main draw dispatcher
     # --------------------------------------------------------
     def _draw_video_background(self):
-        # Draw MP4 video frame behind game if available - try AV first (more reliable)
-        tex = None
-        # 1) AV decoded frame (for mp4 that pyglet can't decode)
-        if getattr(self, '_av_last_frame_image', None) is not None:
-            tex = self._av_last_frame_image
-            # tex may be ImageData or Texture, try to get texture
-            try:
-                if hasattr(tex, 'get_texture'):
-                    tex = tex.get_texture()
-            except:
-                pass
-            if tex and tex.width > 0:
-                # draw AV frame
-                try:
-                    if not hasattr(self, '_video_sprite') or self._video_sprite is None or getattr(self._video_sprite, 'image', None) != tex:
-                        # need to handle ImageData vs Texture
-                        self._video_sprite = pyglet.sprite.Sprite(tex, x=0, y=0)
-                    else:
-                        if self._video_sprite.image != tex:
-                            self._video_sprite.image = tex
-                    scale = max(self.width / tex.width, self.height / tex.height)
-                    self._video_sprite.scale = scale
-                    new_w = tex.width * scale
-                    new_h = tex.height * scale
-                    self._video_sprite.x = (WINDOW_W - new_w) // 2
-                    self._video_sprite.y = (WINDOW_H - new_h) // 2
-                    self._video_sprite.opacity = 110
-                    self._video_sprite.draw()
-                    overlay = pyglet.shapes.Rectangle(0, 0, self.width, self.height, color=(6, 6, 14))
-                    overlay.opacity = 140
-                    overlay.draw()
-                    return True
-                except Exception as e:
-                    pass
-        # 2) pyglet player texture (for natively supported)
+        # Draw MP4 video frame behind game - pyglet FFmpeg syncs texture to audio clock
         if not self.media_player:
             return False
         tex = None
@@ -1999,16 +2066,9 @@ class RhythmGame(pyglet.window.Window):
             return
 
     def on_close(self):
-        # cleanup AV and temp wav
+        # cleanup temp wav
         try:
             self._stop_av_thread()
-        except: pass
-        try:
-            if getattr(self, '_av_container', None):
-                try:
-                    self._av_container.close()
-                except: pass
-                self._av_container = None
         except: pass
         try:
             if getattr(self, '_temp_audio_wav', None) and os.path.exists(self._temp_audio_wav):
