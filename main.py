@@ -15,6 +15,7 @@ Controls (state-dependent):
   Global:    O open file, ESC quit from menu
 """
 
+import json
 import math
 import os
 import sys
@@ -22,11 +23,19 @@ import time
 import tempfile
 import subprocess
 import wave
+import threading
+import hashlib
 from pathlib import Path
 
 import pyglet
 from pyglet.window import key
 import numpy as np
+try:
+    import av
+    HAS_AV = True
+except:
+    HAS_AV = False
+    av = None
 
 # ------------------------------------------------------------
 # Config
@@ -52,6 +61,9 @@ CHAR_TO_LANE = {'d': 'd', 'f': 'f', 'j': 'j', 'k': 'k'}
 
 SONGS_DIR = Path(__file__).resolve().parent / "songs"
 SUPPORTED_EXTS = {".mp4", ".m4v", ".mov", ".avi", ".mkv", ".mp3", ".wav", ".m4a", ".ogg", ".flac", ".webm"}
+CACHE_DIR = SONGS_DIR / ".cache"
+# predetermined cache for demo/example (so no wait)
+PREDETERMINED = {}  # filled below after functions
 
 # ------------------------------------------------------------
 # Demo pattern
@@ -117,6 +129,62 @@ def get_songs_in_folder(songs_dir=None):
     return files
 
 # ------------------------------------------------------------
+# Beatmap cache (predetermined for demo/example, progress bar)
+# ------------------------------------------------------------
+def get_cache_path(media_path):
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    except: pass
+    # use stem + hash to avoid collisions
+    stem = Path(media_path).stem
+    h = hashlib.md5(str(Path(media_path).resolve()).encode()).hexdigest()[:8]
+    return CACHE_DIR / f"{stem}_{h}.json"
+
+def load_cached_beatmap(media_path, sensitivity=1.0):
+    cp = get_cache_path(media_path)
+    if not cp.exists():
+        return None
+    try:
+        with open(cp, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        # validate mtime and sensitivity
+        src = Path(media_path)
+        if not src.exists():
+            return None
+        cached_mtime = data.get('mtime', 0)
+        if abs(cached_mtime - src.stat().st_mtime) > 1:
+            return None
+        if abs(data.get('sensitivity', 1.0) - sensitivity) > 0.01:
+            return None
+        bm = data.get('beatmap', [])
+        duration = data.get('duration', 30.0)
+        tempo = data.get('tempo', 120.0)
+        # convert beatmap back to list of tuples
+        beatmap = [(float(t), str(lane)) for t, lane in bm]
+        return beatmap, float(duration), float(tempo)
+    except Exception as e:
+        print(f"[cache] load failed {e}")
+        return None
+
+def save_cached_beatmap(media_path, beatmap, duration, tempo, sensitivity=1.0):
+    try:
+        cp = get_cache_path(media_path)
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        data = {
+            'beatmap': [[float(t), str(lane)] for t, lane in beatmap],
+            'duration': float(duration),
+            'tempo': float(tempo),
+            'sensitivity': float(sensitivity),
+            'mtime': Path(media_path).stat().st_mtime if Path(media_path).exists() else 0,
+            'version': 2
+        }
+        with open(cp, 'w', encoding='utf-8') as f:
+            json.dump(data, f)
+        print(f"[cache] saved {cp} ({len(beatmap)} beats)")
+    except Exception as e:
+        print(f"[cache] save failed {e}")
+
+# ------------------------------------------------------------
 # Audio analysis via ffmpeg + numpy
 # ------------------------------------------------------------
 def extract_wav_with_ffmpeg(media_path, wav_path, sr=44100):
@@ -157,7 +225,7 @@ def read_wav_mono(wav_path):
             audio /= 2147483648.0
         return framerate, audio
 
-def detect_beats_energy(sr, audio, sensitivity=1.0):
+def detect_beats_energy(sr, audio, sensitivity=1.0, progress_cb=None):
     hop = 512
     n_frames = 1 + (len(audio) - 1024) // hop
     if n_frames <= 0:
@@ -167,6 +235,8 @@ def detect_beats_energy(sr, audio, sensitivity=1.0):
         start = i * hop
         chunk = audio[start:start+1024]
         energies[i] = np.sqrt(np.mean(chunk * chunk) + 1e-10)
+        if progress_cb and i % 8000 == 0:
+            progress_cb(0.45 + 0.25 * i / max(1, n_frames))
     kernel = np.ones(3)/3
     energies_smooth = np.convolve(energies, kernel, mode='same')
     win = int(0.6 * sr / hop)
@@ -200,16 +270,27 @@ def detect_beats_energy(sr, audio, sensitivity=1.0):
     times = [p * hop / sr for p in peaks]
     return times
 
-def beats_from_media(media_path, sensitivity=1.0, use_librosa=True):
+def beats_from_media(media_path, sensitivity=1.0, use_librosa=True, progress_cb=None):
+    def prog(v):
+        if progress_cb:
+            try:
+                progress_cb(max(0.0, min(1.0, v)))
+            except:
+                pass
+    prog(0.05)
     if use_librosa:
         try:
             import librosa
+            prog(0.1)
             y, sr = librosa.load(str(media_path), sr=22050, mono=True)
+            prog(0.35)
             tempo, beat_frames = librosa.beat.beat_track(y=y, sr=sr, units='time')
+            prog(0.55)
             if len(beat_frames) < 20:
                 onset_env = librosa.onset.onset_strength(y=y, sr=sr)
                 onsets = librosa.onset.onset_detect(onset_envelope=onset_env, sr=sr, units='time')
                 beat_frames = sorted(set(list(beat_frames) + list(onsets)))
+            prog(0.75)
             filtered = []
             for t in sorted(beat_frames):
                 if not filtered or t - filtered[-1] > 0.14:
@@ -224,22 +305,27 @@ def beats_from_media(media_path, sensitivity=1.0, use_librosa=True):
                 else:
                     lane = LANE_ORDER[idx % 4]
                 lane_pattern.append((float(t), lane))
+            prog(1.0)
             return lane_pattern, float(duration), float(tempo) if hasattr(tempo, '__float__') else 120.0
         except ImportError:
             pass
         except Exception as e:
             print(f"[librosa] failed {e}, falling back to numpy method")
     try:
+        prog(0.12)
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
             wav_path = tf.name
         sr = 44100
+        prog(0.18)
         extract_wav_with_ffmpeg(media_path, wav_path, sr=sr)
+        prog(0.35)
         sr_read, audio = read_wav_mono(wav_path)
         try:
             os.unlink(wav_path)
         except: pass
         duration = len(audio) / sr_read
-        times = detect_beats_energy(sr_read, audio, sensitivity=sensitivity)
+        prog(0.42)
+        times = detect_beats_energy(sr_read, audio, sensitivity=sensitivity, progress_cb=lambda p: prog(0.42 + 0.4*p))
         if len(times) < 8:
             print("[detect] too few onsets, generating BPM grid")
             bpm = 128
@@ -254,6 +340,9 @@ def beats_from_media(media_path, sensitivity=1.0, use_librosa=True):
                 other = LANE_ORDER[(LANE_ORDER.index(lane)+2)%4]
                 beatmap.append((float(t), other))
         beatmap = sorted(beatmap, key=lambda x: x[0])
+        prog(0.92)
+        # also handle librosa return prog
+        prog(1.0)
         return beatmap, float(duration), 120.0
     except Exception as e:
         print(f"[ffmpeg/numpy] beat detection failed: {e}")
@@ -440,6 +529,20 @@ class RhythmGame(pyglet.window.Window):
             self._menu_lane_lbls.append(lbl)
         # song select persistent
         self._song_panel = pyglet.shapes.Rectangle(200, 100, 880, 460, color=(18,18,30))
+        # video background sprite (for MP4)
+        self._video_sprite = None
+        self._av_container = None
+        self._av_video_stream = None
+        self._av_frame_iter = None
+        self._av_last_frame_image = None
+        self._temp_audio_wav = None
+        self.analysis_progress = 0.0
+        self.analysis_msg = ""
+        self._analysis_done = False
+        self._analysis_result = None
+        self._analysis_error = None
+        self._analysis_path = None
+        self._analysis_autoplay = False
 
     # ---------- helpers ----------
     def refresh_song_list(self):
@@ -514,51 +617,204 @@ class RhythmGame(pyglet.window.Window):
                 return
         self.load_media(path)
 
-    def load_media(self, path):
+    def _prepare_media_player(self, path):
+        # (re)create pyglet player for video/audio playback
+        # also setup AV video for mp4 background if needed
+        # cleanup previous av
+        if getattr(self, '_av_container', None):
+            try:
+                self._av_container.close()
+            except: pass
+            self._av_container = None
+            self._av_video_stream = None
+            self._av_frame_iter = None
+            self._av_last_frame_image = None
+        if getattr(self, '_temp_audio_wav', None) and os.path.exists(self._temp_audio_wav):
+            try:
+                os.unlink(self._temp_audio_wav)
+            except: pass
+            self._temp_audio_wav = None
+        try:
+            if self.media_player:
+                try: self.media_player.delete()
+                except: pass
+                self.media_player = None
+            self.media_source = pyglet.media.load(str(path), streaming=True)
+            self.media_player = pyglet.media.Player()
+            self.media_player.queue(self.media_source)
+            # reset video sprite so it picks up new texture
+            self._video_sprite = None
+            has_video = bool(getattr(self.media_source, 'video_format', None))
+            print(f"[media] loaded duration {self.media_source.duration} (has video: {has_video})")
+            # if has video and HAS_AV, also setup av for more reliable video background
+            if has_video and HAS_AV:
+                try:
+                    self._av_container = av.open(str(path))
+                    for s in self._av_container.streams:
+                        if s.type == 'video':
+                            self._av_video_stream = s
+                            break
+                    if self._av_video_stream:
+                        print(f"[video] av fallback ready {self._av_video_stream.width}x{self._av_video_stream.height}")
+                except Exception as ve:
+                    print(f"[video] av setup failed {ve}")
+            return True
+        except Exception as e:
+            print(f"[media] pyglet load failed: {e}")
+            # fallback for video files: extract audio + setup av video
+            if HAS_AV and Path(path).suffix.lower() in {".mp4", ".m4v", ".mov", ".avi", ".mkv", ".webm"}:
+                try:
+                    # extract audio to temp wav for playback
+                    tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.wav')
+                    tmp.close()
+                    print(f"[media] extracting audio for fallback {tmp.name}")
+                    extract_wav_with_ffmpeg(path, tmp.name, sr=44100)
+                    self.media_source = pyglet.media.load(tmp.name, streaming=True)
+                    self.media_player = pyglet.media.Player()
+                    self.media_player.queue(self.media_source)
+                    self._temp_audio_wav = tmp.name
+                    self._video_sprite = None
+                    print(f"[media] fallback audio loaded {tmp.name} duration {self.media_source.duration}")
+                    # setup av video
+                    try:
+                        self._av_container = av.open(str(path))
+                        for s in self._av_container.streams:
+                            if s.type == 'video':
+                                self._av_video_stream = s
+                                break
+                        if self._av_video_stream:
+                            print(f"[video] av video {self._av_video_stream.width}x{self._av_video_stream.height}")
+                    except Exception as ve:
+                        print(f"[video] av failed {ve}")
+                    return True
+                except Exception as fe:
+                    print(f"[media] fallback failed {fe}")
+                    import traceback
+                    traceback.print_exc()
+            self.media_source = None
+            self.media_player = None
+            return False
+
+    def _on_analysis_done(self, path, beatmap, duration, tempo, error=None, autoplay=False):
+        # called from main thread via clock
+        if error:
+            self.state = "song_select" if self.song_files else "menu"
+            self.feedback_text = f"Analysis failed: {error}"
+            self.feedback_color = (255, 80, 80, 255)
+            self.feedback_time = time.time()
+            self.analysis_progress = 0
+            return
+        self.beatmap = beatmap
+        self.duration = duration
+        self.media_path = path
+        # also prepare player
+        self._prepare_media_player(path)
+        self.reset_play_state()
+        self.analysis_progress = 1.0
+        # save cache for next time (predetermined)
+        try:
+            save_cached_beatmap(path, beatmap, duration, tempo, self.sensitivity)
+        except: pass
+        self.feedback_text = f"Ready: {len(beatmap)} beats | ENTER to play | tempo ~{int(tempo)}"
+        self.feedback_color = (100, 255, 150, 255)
+        self.feedback_time = time.time()
+        self.is_media_mode = False
+        # if autoplay (from song select), start immediately - but only if still analyzing (not cancelled)
+        if autoplay and self.state == "analyzing":
+            self.start_media()
+        elif self.state == "analyzing":
+            # stay in song_select/menu but show ready
+            self.state = "song_select" if self.song_files else "menu"
+
+    def _analysis_thread_func(self, path, sensitivity, autoplay):
+        # runs in background thread - set flag, main thread picks up in update()
+        try:
+            def prog_cb(p):
+                self.analysis_progress = max(0.0, min(1.0, p))
+                self.analysis_msg = f"Analysing {Path(path).name} {int(p*100)}%"
+            beatmap, duration, tempo = beats_from_media(path, sensitivity=sensitivity, use_librosa=True, progress_cb=prog_cb)
+            self._analysis_result = (beatmap, duration, tempo)
+            self._analysis_error = None
+            self._analysis_autoplay = autoplay
+            self._analysis_done = True
+            self._analysis_path = path
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self._analysis_error = str(e)
+            self._analysis_done = True
+            self._analysis_path = path
+            self._analysis_autoplay = False
+
+    def load_media(self, path, autoplay=False):
         if not os.path.exists(path):
             self.feedback_text = f"File not found: {path}"
             self.feedback_color = (255, 80, 80, 255)
             self.feedback_time = time.time()
             return
-        self.media_path = path
-        self.feedback_text = f"Analysing {Path(path).name} ..."
-        self.feedback_color = (255, 220, 100, 255)
-        self.feedback_time = time.time()
-        # quick draw to show analysing text before blocking
-        try:
-            self.dispatch_event('on_draw')
-            self.flip()
-        except: pass
-        print(f"[load] analysing {path} sensitivity={self.sensitivity}")
-        try:
-            beatmap, duration, tempo = beats_from_media(path, sensitivity=self.sensitivity, use_librosa=True)
+        # check cache first (predetermined for demo/example)
+        # special predetermined for _example_beats.wav - if no cache, create one instantly
+        p = Path(path)
+        if p.name == "_example_beats.wav" and not get_cache_path(path).exists():
+            # predetermined: use known click track at ~128bpm (the file we generated)
+            # we know its duration ~20s and beats every 0.468s, just use generate pattern
+            try:
+                # try to get duration via pyglet or assume 20
+                dur = 20.0
+                try:
+                    import wave
+                    with wave.open(str(path), 'rb') as wf:
+                        dur = wf.getnframes() / wf.getframerate()
+                except:
+                    pass
+                # generate a 128bpm grid that matches the click track for instant
+                bpm = 128
+                interval = 60.0 / bpm
+                # use actual detection for this file is 44 beats, but we can mimic
+                # for predetermined, use simple 4-lane cycle
+                beatmap = [(i*interval, LANE_ORDER[i%4]) for i in range(int(dur/interval))]
+                # save as cache so next time is also instant
+                save_cached_beatmap(path, beatmap, dur, bpm, self.sensitivity)
+                print(f"[predetermined] _example_beats.wav -> {len(beatmap)} beats (instant)")
+            except Exception as e:
+                print(f"[predetermined] failed {e}")
+
+        cached = load_cached_beatmap(path, sensitivity=self.sensitivity)
+        if cached:
+            beatmap, duration, tempo = cached
+            print(f"[cache] hit {Path(path).name} -> {len(beatmap)} beats (instant)")
             self.beatmap = beatmap
             self.duration = duration
-            print(f"[load] got {len(beatmap)} beats, duration {duration:.1f}s tempo {tempo}")
-            try:
-                if self.media_player:
-                    try: self.media_player.delete()
-                    except: pass
-                    self.media_player = None
-                self.media_source = pyglet.media.load(str(path), streaming=True)
-                self.media_player = pyglet.media.Player()
-                self.media_player.queue(self.media_source)
-                print(f"[media] loaded duration {self.media_source.duration}")
-            except Exception as e:
-                print(f"[media] pyglet load failed: {e}")
-                self.media_source = None
-                self.media_player = None
+            self.media_path = path
+            self._prepare_media_player(path)
             self.reset_play_state()
-            self.feedback_text = f"Ready: {len(beatmap)} beats | ENTER to play | tempo ~{int(tempo)}"
+            self.feedback_text = f"Ready (cached): {len(beatmap)} beats | ENTER to play"
             self.feedback_color = (100, 255, 150, 255)
             self.feedback_time = time.time()
             self.is_media_mode = False
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            self.feedback_text = f"Analysis failed: {e}"
-            self.feedback_color = (255, 80, 80, 255)
-            self.feedback_time = time.time()
+            self.analysis_progress = 1.0
+            if autoplay:
+                self.start_media()
+            return
+
+        # not cached -> need analysis with progress bar
+        self.media_path = path
+        self.analysis_progress = 0.0
+        self.analysis_msg = f"Analysing {Path(path).name} ..."
+        self.feedback_text = self.analysis_msg
+        self.feedback_color = (255, 220, 100, 255)
+        self.feedback_time = time.time()
+        self.state = "analyzing"
+        self._analysis_done = False
+        self._analysis_result = None
+        self._analysis_error = None
+        self._analysis_path = path
+        self._analysis_autoplay = autoplay
+        self._pending_autoplay = autoplay
+        print(f"[load] analysing {path} sensitivity={self.sensitivity} (threaded)")
+        # start thread
+        t = threading.Thread(target=self._analysis_thread_func, args=(path, self.sensitivity, autoplay), daemon=True)
+        t.start()
 
     def start_media(self):
         if not self.beatmap or not self.media_path:
@@ -578,6 +834,16 @@ class RhythmGame(pyglet.window.Window):
                 self.start_time = time.time()
             except Exception as e:
                 print(f"player play failed {e}")
+        # setup AV video for background (seek to 0)
+        if getattr(self, '_av_container', None) and getattr(self, '_av_video_stream', None):
+            try:
+                self._av_container.seek(0)
+                # recreate iterator
+                self._av_frame_iter = self._av_container.decode(video=0)
+                self._av_last_frame_image = None
+                self._video_sprite = None
+            except Exception as e:
+                print(f"[video] seek failed {e}")
         self.feedback_text = "PLAYING"
         self.feedback_color = (74, 255, 138, 255)
         self.feedback_time = time.time()
@@ -619,6 +885,19 @@ class RhythmGame(pyglet.window.Window):
                     self.lane_flash[k] = max(0, self.lane_flash[k] - dt*3)
             if self.hit_pulse > 0:
                 self.hit_pulse = max(0, self.hit_pulse - dt*4)
+            # handle async analysis completion
+            if self.state == "analyzing" and getattr(self, '_analysis_done', False):
+                # grab result on main thread
+                self._analysis_done = False
+                if self._analysis_error:
+                    self._on_analysis_done(self._analysis_path, [], 30.0, 120.0, error=self._analysis_error, autoplay=False)
+                else:
+                    bm, dur, tempo = self._analysis_result if self._analysis_result else ([], 30.0, 120.0)
+                    self._on_analysis_done(self._analysis_path, bm, dur, tempo, error=None, autoplay=self._analysis_autoplay)
+                # clear
+                self._analysis_result = None
+                self._analysis_error = None
+                return
             # keep song count fresh in menu/song_select (without IO every frame)
             if self.state in ("menu", "song_select"):
                 if not hasattr(self, '_last_refresh') or time.time() - self._last_refresh > 1.5:
@@ -628,10 +907,62 @@ class RhythmGame(pyglet.window.Window):
         if not self.is_playing:
             return
         song_t = self.get_song_time()
+        # update AV video frame for mp4 background (8fps, scaled for perf) - 60fps target
+        if getattr(self, '_av_container', None) and getattr(self, '_av_video_stream', None) and self.is_media_mode:
+            try:
+                if not hasattr(self, '_av_last_video_time'):
+                    self._av_last_video_time = -999
+                if song_t - self._av_last_video_time >= 1/8.0:
+                    if self._av_frame_iter is None:
+                        try:
+                            self._av_container.seek(0)
+                        except: pass
+                        try:
+                            self._av_frame_iter = self._av_container.decode(video=0)
+                        except:
+                            self._av_frame_iter = None
+                    if self._av_frame_iter is not None:
+                        try:
+                            frame = next(self._av_frame_iter)
+                            # scale down for perf (1280->640)
+                            if frame.width > 640:
+                                try:
+                                    frame = frame.reformat(width=640, height=360, format='rgb24')
+                                except:
+                                    pass
+                            arr = frame.to_ndarray(format='rgb24')
+                            img = pyglet.image.ImageData(frame.width, frame.height, 'RGB', arr.tobytes(), pitch=-frame.width*3)
+                            self._av_last_frame_image = img.get_texture()
+                            self._av_last_video_time = song_t
+                        except StopIteration:
+                            try:
+                                self._av_container.seek(0)
+                                self._av_frame_iter = self._av_container.decode(video=0)
+                                frame = next(self._av_frame_iter)
+                                if frame.width > 640:
+                                    try:
+                                        frame = frame.reformat(width=640, height=360, format='rgb24')
+                                    except:
+                                        pass
+                                arr = frame.to_ndarray(format='rgb24')
+                                img = pyglet.image.ImageData(frame.width, frame.height, 'RGB', arr.tobytes(), pitch=-frame.width*3)
+                                self._av_last_frame_image = img.get_texture()
+                                self._av_last_video_time = song_t
+                            except:
+                                pass
+                        except:
+                            pass
+            except:
+                pass
         self.spawn_beats(song_t)
         still_active = []
         for b in self.active_beats:
             delta = song_t - b['time']
+            # if already in miss fade, keep fading for 0.45s
+            if b.get('missed'):
+                if song_t - b['miss_time'] < 0.45:
+                    still_active.append(b)
+                continue
             if not b['hit'] and delta > HIT_WINDOW_OK:
                 self.hits['miss'] += 1
                 self.combo = 0
@@ -641,6 +972,10 @@ class RhythmGame(pyglet.window.Window):
                     self.feedback_color = (255, 80, 80, 255)
                     self.feedback_time = time.time()
                 self.lane_flash[b['lane']] = 1.0
+                b['missed'] = True
+                b['miss_time'] = song_t
+                # keep for fade-out instead of instant remove
+                still_active.append(b)
                 continue
             if delta > 1.0 and b['hit']:
                 continue
@@ -678,7 +1013,7 @@ class RhythmGame(pyglet.window.Window):
         best = None
         best_delta = 999
         for b in self.active_beats:
-            if b['lane'] != lane_char or b['hit']:
+            if b['lane'] != lane_char or b['hit'] or b.get('missed'):
                 continue
             delta = abs(song_t - b['time'])
             if delta < best_delta:
@@ -781,10 +1116,7 @@ class RhythmGame(pyglet.window.Window):
             if symbol in (key.ENTER, key.SPACE, key.NUM_ENTER):
                 if self.song_files:
                     chosen = self.song_files[self.song_index]
-                    self.load_media(str(chosen))
-                    # auto start after load if beatmap ready
-                    if self.beatmap:
-                        self.start_media()
+                    self.load_media(str(chosen), autoplay=True)
                 else:
                     self.feedback_text = "No songs - add files to songs/ folder"
                     self.feedback_color = (255,180,80,255)
@@ -801,10 +1133,16 @@ class RhythmGame(pyglet.window.Window):
                 return
             if symbol == key.P and self.song_files:
                 chosen = self.song_files[self.song_index]
-                self.load_media(str(chosen))
-                if self.beatmap:
-                    self.start_media()
+                self.load_media(str(chosen), autoplay=True)
                 return
+
+        elif self.state == "analyzing":
+            if symbol in (key.ESCAPE, key.B):
+                # cancel - go back (thread will finish but result ignored)
+                self.state = "song_select"
+                self.analysis_progress = 0
+                return
+            return
 
         elif self.state == "playing":
             if symbol == key.ESCAPE:
@@ -1048,6 +1386,32 @@ class RhythmGame(pyglet.window.Window):
             inner_c = slot['inner']
             tail = slot['tail']
             hit_circ = slot['hit']
+            if b.get('missed'):
+                elapsed = song_t - b['miss_time']
+                prog = elapsed / 0.45
+                if prog >= 1:
+                    circ.visible = False
+                    inner_c.visible = False
+                    tail.visible = False
+                    hit_circ.visible = False
+                    pool_idx += 1
+                    continue
+                ang = math.radians(b['angle'])
+                x = cx + math.cos(ang) * TARGET_RADIUS
+                y = cy + math.sin(ang) * TARGET_RADIUS
+                alpha = int(160 * (1 - prog))
+                sz = 22 * (1 - prog*0.3)
+                col = LANES[b['lane']]['color']
+                # dim to grey-ish for miss fade
+                dim_col = tuple(int(c*0.45 + 45) for c in col)
+                circ.x = x; circ.y = y; circ.radius = sz; circ.color = dim_col
+                circ.opacity = max(0, alpha)
+                circ.visible = True
+                inner_c.visible = False
+                tail.visible = False
+                hit_circ.visible = False
+                pool_idx += 1
+                continue
             if b['hit']:
                 delta = song_t - b['time'] if self.is_playing else 0
                 if delta < 0: delta = 0
@@ -1158,10 +1522,105 @@ class RhythmGame(pyglet.window.Window):
     # --------------------------------------------------------
     # Main draw dispatcher
     # --------------------------------------------------------
+    def _draw_video_background(self):
+        # Draw MP4 video frame behind game if available - try AV first (more reliable)
+        tex = None
+        # 1) AV decoded frame (for mp4 that pyglet can't decode)
+        if getattr(self, '_av_last_frame_image', None) is not None:
+            tex = self._av_last_frame_image
+            # tex may be ImageData or Texture, try to get texture
+            try:
+                if hasattr(tex, 'get_texture'):
+                    tex = tex.get_texture()
+            except:
+                pass
+            if tex and tex.width > 0:
+                # draw AV frame
+                try:
+                    if not hasattr(self, '_video_sprite') or self._video_sprite is None or getattr(self._video_sprite, 'image', None) != tex:
+                        # need to handle ImageData vs Texture
+                        self._video_sprite = pyglet.sprite.Sprite(tex, x=0, y=0)
+                    else:
+                        if self._video_sprite.image != tex:
+                            self._video_sprite.image = tex
+                    scale = max(WINDOW_W / tex.width, WINDOW_H / tex.height)
+                    self._video_sprite.scale = scale
+                    new_w = tex.width * scale
+                    new_h = tex.height * scale
+                    self._video_sprite.x = (WINDOW_W - new_w) // 2
+                    self._video_sprite.y = (WINDOW_H - new_h) // 2
+                    self._video_sprite.opacity = 110
+                    self._video_sprite.draw()
+                    overlay = pyglet.shapes.Rectangle(0, 0, WINDOW_W, WINDOW_H, color=(6, 6, 14))
+                    overlay.opacity = 140
+                    overlay.draw()
+                    return True
+                except Exception as e:
+                    pass
+        # 2) pyglet player texture (for natively supported)
+        if not self.media_player:
+            return False
+        tex = None
+        try:
+            # pyglet 2.1: player.texture, older: get_texture()
+            if hasattr(self.media_player, 'texture'):
+                tex = self.media_player.texture
+            if tex is None and hasattr(self.media_player, 'get_texture'):
+                try:
+                    tex = self.media_player.get_texture()
+                except:
+                    tex = None
+        except:
+            tex = None
+        if tex is None or tex.width == 0 or tex.height == 0:
+            return False
+        # Create or update sprite
+        if not hasattr(self, '_video_sprite') or self._video_sprite is None:
+            try:
+                self._video_sprite = pyglet.sprite.Sprite(tex, x=0, y=0)
+            except:
+                return False
+        else:
+            try:
+                # Update image if changed
+                if self._video_sprite.image != tex:
+                    self._video_sprite.image = tex
+            except:
+                pass
+        # Scale to cover window (like CSS background-size: cover)
+        try:
+            scale = max(WINDOW_W / tex.width, WINDOW_H / tex.height)
+            self._video_sprite.scale = scale
+            # need to set scale before position? sprite scale affects width/height
+            new_w = tex.width * scale
+            new_h = tex.height * scale
+            self._video_sprite.x = (WINDOW_W - new_w) // 2
+            self._video_sprite.y = (WINDOW_H - new_h) // 2
+            self._video_sprite.opacity = 110  # dim so game visible
+            self._video_sprite.draw()
+            # dim overlay for readability
+            overlay = pyglet.shapes.Rectangle(0, 0, WINDOW_W, WINDOW_H, color=(6, 6, 14))
+            overlay.opacity = 140
+            overlay.draw()
+            return True
+        except Exception as e:
+            # fallback blit
+            try:
+                tex.blit(0, 0, width=WINDOW_W, height=WINDOW_H)
+                overlay = pyglet.shapes.Rectangle(0, 0, WINDOW_W, WINDOW_H, color=(6, 6, 14))
+                overlay.opacity = 140
+                overlay.draw()
+                return True
+            except:
+                return False
+
     def on_draw(self):
         self.clear()
         cx, cy = CENTER
         if self.state in ("playing", "paused", "results"):
+            # video background for MP4 (behind everything)
+            if self.state == "playing" and self.is_media_mode:
+                self._draw_video_background()
             # game bg - update batched shapes
             pulse = self.hit_pulse
             self._draw_center_target(cx, cy, pulse)
@@ -1223,6 +1682,56 @@ class RhythmGame(pyglet.window.Window):
                 instr = ""
             if instr:
                 self._draw_label(instr, x=WINDOW_W//2, y=18, size=9, color=(130,130,160,255), anchor_x='center', anchor_y='center', font_name='Consolas')
+            return
+
+        if self.state == "analyzing":
+            # analysis progress screen
+            cx, cy = WINDOW_W//2, WINDOW_H//2
+            # dim bg
+            bg = pyglet.shapes.Rectangle(0, 0, WINDOW_W, WINDOW_H, color=(10, 10, 18))
+            bg.draw()
+            # card
+            card_w, card_h = 700, 260
+            card_x = (WINDOW_W - card_w)//2
+            card_y = (WINDOW_H - card_h)//2
+            card = pyglet.shapes.Rectangle(card_x, card_y, card_w, card_h, color=(22, 22, 34))
+            card.draw()
+            # title
+            self._draw_label("ANALYSING", x=WINDOW_W//2, y=card_y+card_h-40, size=22, weight='bold', color=(255, 220, 100, 255), anchor_x='center', anchor_y='center')
+            fname = Path(self.media_path).name if self.media_path else "song"
+            if len(fname) > 48:
+                fname = fname[:45] + "..."
+            self._draw_label(fname, x=WINDOW_W//2, y=card_y+card_h-80, size=11, color=(180, 180, 210, 255), anchor_x='center', anchor_y='center', font_name='Consolas')
+            self._draw_label(self.analysis_msg or "Extracting beats...", x=WINDOW_W//2, y=card_y+card_h-110, size=10, color=(140, 160, 190, 255), anchor_x='center', anchor_y='center', font_name='Consolas')
+            # progress bar bg
+            bar_w, bar_h = 520, 18
+            bar_x = (WINDOW_W - bar_w)//2
+            bar_y = card_y + 90
+            bar_bg = pyglet.shapes.Rectangle(bar_x, bar_y, bar_w, bar_h, color=(40, 40, 60))
+            bar_bg.draw()
+            # progress fill
+            prog = max(0.0, min(1.0, self.analysis_progress))
+            # animate a little shimmer if progress stuck
+            fill_w = int(bar_w * prog)
+            if fill_w > 0:
+                bar_fg = pyglet.shapes.Rectangle(bar_x, bar_y, fill_w, bar_h, color=(100, 220, 160))
+                bar_fg.draw()
+                # shimmer
+                shimmer_w = 40
+                t = time.time() * 2.5
+                shimmer_x = bar_x + (int((t % 2.0) * (bar_w + shimmer_w)) - shimmer_w) if prog < 1.0 else bar_x
+                # only draw shimmer inside fill
+                if prog > 0.02 and prog < 0.99:
+                    # clip shimmer to fill
+                    sx = max(bar_x, min(bar_x+fill_w - shimmer_w, shimmer_x))
+                    sh = pyglet.shapes.Rectangle(sx, bar_y, shimmer_w, bar_h, color=(160, 255, 190))
+                    sh.opacity = 90
+                    sh.draw()
+            self._draw_label(f"{int(prog*100)}%", x=WINDOW_W//2, y=bar_y+bar_h//2, size=10, weight='bold', color=(255, 255, 255, 255), anchor_x='center', anchor_y='center', font_name='Consolas')
+            # cached hint
+            self._draw_label("First load analyses via ffmpeg • next load is instant (cached)", x=WINDOW_W//2, y=card_y+45, size=9, color=(110, 120, 150, 255), anchor_x='center', anchor_y='center', font_name='Consolas')
+            self._draw_label("ESC to cancel", x=WINDOW_W//2, y=card_y+22, size=9, color=(140, 140, 170, 255), anchor_x='center', anchor_y='center', font_name='Consolas')
+            # also draw video preview dim if available? skip
             return
 
         if self.state == "menu":
@@ -1342,6 +1851,21 @@ class RhythmGame(pyglet.window.Window):
                 alpha = int(180 * (1 - age/3.0))
                 self._draw_label(self.feedback_text, x=WINDOW_W//2, y=60, size=10, color=(*self.feedback_color[:3], max(0,alpha)), anchor_x='center', anchor_y='center', font_name='Consolas')
             return
+
+    def on_close(self):
+        # cleanup AV and temp wav
+        try:
+            if getattr(self, '_av_container', None):
+                try:
+                    self._av_container.close()
+                except: pass
+                self._av_container = None
+        except: pass
+        try:
+            if getattr(self, '_temp_audio_wav', None) and os.path.exists(self._temp_audio_wav):
+                os.unlink(self._temp_audio_wav)
+        except: pass
+        super().on_close()
 
 def main():
     try:
