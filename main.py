@@ -442,11 +442,11 @@ def detect_beats_sfx(sr, audio, sensitivity=1.0, progress_cb=None):
     return [float(t) for t in beats], float(bpm)
 
 def detect_beats_madmom(sr, audio, sensitivity=1.0, difficulty="easy", voice_focus=True, progress_cb=None):
-    """madmom RNN onset detection with voice/melody focus.
-    * Easy*: sparse main beats (~1.45/s) filtered to most voice-like.
-    * Hard*: dense (~3.0/s) but still voice-biased.
-    Both use dense pool + voice-ratio selection so melody/voice dominate.
-    Returns (beat_times, tempo)."""
+    """madmom RNN onset detection with strong voice/melody focus.
+    Harmonic/percussive flux weights madmom activation so voice/melody onsets
+    dominate. Easy (~1.45/s) is voice-only with fallback to other parts only
+    in gaps where no voice exists. Hard (~3.0/s) keeps voice priority but
+    retains more percussive fills."""
     import numpy as _np
     from madmom.features.onsets import RNNOnsetProcessor, OnsetPeakPickingProcessor
     def prog(v):
@@ -455,68 +455,96 @@ def detect_beats_madmom(sr, audio, sensitivity=1.0, difficulty="easy", voice_foc
             except: pass
     prog(0.1)
     acts = RNNOnsetProcessor()(audio.astype(_np.float32, copy=False), sample_rate=sr)
-    prog(0.6)
-    # dense pool - low threshold to capture many candidates (incl. voice)
-    # sensitivity fine-tunes pool slightly: higher s -> lower threshold
-    s = max(0.2, min(2.0, float(sensitivity)))
-    pool_thr = float(0.38 - 0.04*s)  # 0.34 @1.0, 0.30 @2.0
-    pool_thr = max(0.28, min(0.45, pool_thr))
-    pool_comb = 0.10
-    pool_mg = 0.12
-    peak = OnsetPeakPickingProcessor(threshold=pool_thr, combine=pool_comb, fps=100)
-    pool = [float(t) for t in peak(acts)]
-    # pool min_gap
-    tmp = []
-    for t in pool:
-        if not tmp or t - tmp[-1] >= pool_mg:
-            tmp.append(t)
-    pool = tmp
-    prog(0.75)
-    dur = len(audio)/float(sr) if sr else 30.0
+    prog(0.55)
+    # harmonic voice weights (0..1, high = harmonic/voice)
+    voice_w = None
+    if voice_focus:
+        try:
+            voice_w = _harmonic_voice_weights(sr, audio, len(acts), fps_target=100)
+        except:
+            voice_w = None
+    # choose weighting per difficulty: easy strongly suppresses percussive,
+    # hard mildly
     difficulty = str(difficulty).lower() if difficulty else "easy"
     if difficulty not in ("easy","hard"):
         difficulty = "easy"
-    # target densities: easy ~1.45/s, hard ~3.0/s  (tuned vs 1.49/3.59 pools)
+    if voice_w is not None and voice_focus:
+        if difficulty == "easy":
+            acts_w = acts * (0.35 + 0.65 * voice_w)  # drums -> 0.35x, voice -> 1.0x
+        else:
+            acts_w = acts * (0.55 + 0.45 * voice_w)
+    else:
+        acts_w = acts
+    prog(0.65)
+    # thresholds tuned for weighted acts: easy sparse but voice-only, hard dense
     if difficulty == "hard":
-        target_n = int(round(dur * 3.0))
-        min_gap = 0.20
-        # hard keeps most of pool but still voice-biased (drop lowest voice 15%)
-        # if pool very dense, keep up to target
-        if voice_focus and len(pool) > 10:
-            beats = _select_voice_focused(pool, sr, audio, target_n, min_gap)
-        else:
-            # no voice filter: just enforce gap
-            kept=[]
-            for t in pool:
-                if not kept or t-kept[-1] >= min_gap:
-                    kept.append(t)
-            beats = kept[:target_n] if len(kept)>target_n else kept
-    else: # easy
-        target_n = int(round(dur * 1.45))
-        min_gap = 0.38
-        if voice_focus and len(pool) > 10:
-            beats = _select_voice_focused(pool, sr, audio, target_n, min_gap)
-        else:
-            # fallback sparse without voice
-            kept=[]
-            for t in pool:
-                if not kept or t-kept[-1] >= min_gap:
-                    kept.append(t)
-            # if still too many, thin by taking every other by threshold
-            if len(kept) > target_n*1.3:
-                # keep most energetic: use acts magnitude
-                # simple: sort by act value
-                vals = []
-                for t in kept:
-                    idx = int(round(t*100))
-                    idx = max(0, min(len(acts)-1, idx))
-                    vals.append(float(acts[idx]))
-                order = np.argsort(np.array(vals))[::-1]
-                sel = sorted([kept[i] for i in order[:target_n]])
-                beats = sel
-            else:
-                beats = kept[:target_n] if len(kept)>target_n else kept
-    # tempo
+        thr, comb, mg = 0.28, 0.10, 0.18
+        target_n = int(round(len(audio)/float(sr) * 3.0))
+    else:
+        thr, comb, mg = 0.32, 0.12, 0.38
+        target_n = int(round(len(audio)/float(sr) * 1.45))
+    peak = OnsetPeakPickingProcessor(threshold=thr, combine=comb, fps=100)
+    beats = [float(t) for t in peak(acts_w)]
+    # enforce min_gap
+    tmp = []
+    for t in beats:
+        if not tmp or t - tmp[-1] >= mg - 1e-6:
+            tmp.append(t)
+    beats = tmp
+    # if too many (dense), keep strongest by weighted activation
+    if len(beats) > target_n * 1.25:
+        vals = []
+        for t in beats:
+            idx = int(round(t*100))
+            idx = max(0, min(len(acts_w)-1, idx))
+            vals.append(float(acts_w[idx]))
+        order = np.argsort(np.array(vals))[::-1]
+        beats = sorted([beats[i] for i in order[:target_n]])
+    elif len(beats) > target_n:
+        beats = beats[:target_n]
+    # easy fallback: if gaps >3.5s where no voice, insert best original (unweighted) onset in gap
+    # so instrumental/break sections still have beats
+    if difficulty == "easy" and voice_focus and len(beats) > 4:
+        # build dense pool from original acts for fallback candidates
+        peak_all = OnsetPeakPickingProcessor(threshold=0.30, combine=0.10, fps=100)
+        pool_all = [float(t) for t in peak_all(acts)]
+        tmp2=[]
+        for t in pool_all:
+            if not tmp2 or t-tmp2[-1] >= 0.12:
+                tmp2.append(t)
+        pool_all = tmp2
+        # find large gaps
+        beats_sorted = sorted(beats)
+        gaps = []
+        # also check start gap
+        if beats_sorted[0] > 4.0:
+            gaps.append((0.0, beats_sorted[0]))
+        for i in range(len(beats_sorted)-1):
+            if beats_sorted[i+1] - beats_sorted[i] > 3.5:
+                gaps.append((beats_sorted[i], beats_sorted[i+1]))
+        # tail gap
+        dur = len(audio)/float(sr)
+        if dur - beats_sorted[-1] > 4.0:
+            gaps.append((beats_sorted[-1], dur))
+        for g0,g1 in gaps:
+            # best candidate inside gap (with margin)
+            cand = [t for t in pool_all if g0+0.3 < t < g1-0.3]
+            if not cand:
+                continue
+            # pick most energetic original
+            best = max(cand, key=lambda t: float(acts[int(round(t*100))]) if 0 <= int(round(t*100)) < len(acts) else 0)
+            # insert if not violating min_gap to neighbors
+            if all(abs(best - b) >= mg*0.8 for b in beats_sorted):
+                beats.append(best)
+        beats = sorted(beats)
+        # re-enforce min_gap after gap inserts (keep earliest)
+        tmp=[]
+        for t in beats:
+            if not tmp or t-tmp[-1] >= mg*0.8:
+                tmp.append(t)
+        beats = tmp
+    prog(0.85)
+    # tempo from harmonic flux? use original flux for tempo (more stable)
     bpm = 120.0
     try:
         _flux = onset_envelope_sfx(sr, audio, hop=512)
@@ -618,6 +646,35 @@ def _select_voice_focused(times, sr, audio, target_n, min_gap):
                 if len(selected) >= target_n:
                     break
     return sorted(selected[:target_n])
+
+def _harmonic_voice_weights(sr, audio, n_target, fps_target=100):
+    """Voice weight per frame aligned to madmom acts (n_target frames at fps_target).
+    Harmonic vs percussive flux ratio - fast version hop 1024."""
+    try:
+        import librosa
+        import scipy.ndimage
+        n_fft = 1024
+        hop = 1024
+        D = np.abs(librosa.stft(audio, n_fft=n_fft, hop_length=hop))
+        harm = scipy.ndimage.median_filter(D, size=(1,9))
+        perc = scipy.ndimage.median_filter(D, size=(9,1))
+        def flux(M):
+            Ml = np.log1p(M*50.0)
+            diff = Ml[:,1:] - Ml[:,:-1]
+            diff[diff<0] = 0
+            return np.concatenate([[0.0], np.sum(diff, axis=0)])
+        flux_h = flux(harm)
+        flux_p = flux(perc)
+        voice_w = flux_h / (flux_h + flux_p + 1e-9)
+        voice_w = np.clip(voice_w, 0, 1)
+        voice_w = np.convolve(voice_w, np.ones(3)/3, mode='same')
+        fps_flux = sr / hop
+        t_flux = np.arange(len(voice_w)) / fps_flux
+        t_target = np.arange(n_target) / fps_target
+        interp = np.interp(t_target, t_flux, voice_w, left=voice_w[0], right=voice_w[-1])
+        return interp
+    except Exception:
+        return None
 
 def _centroids_for_times(times, sr, audio):
     """Spectral centroid per onset (pitch proxy). Returns list[float]."""
