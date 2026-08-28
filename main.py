@@ -428,23 +428,32 @@ def detect_beats_sfx(sr, audio, sensitivity=1.0, progress_cb=None):
     return [float(t) for t in beats], float(bpm)
 
 def detect_beats_madmom(sr, audio, sensitivity=1.0, progress_cb=None):
-    """madmom RNN onset detection (state-of-the-art, content-synced to actual
-    musical events: kicks, snares, notes). Returns (beat_times, tempo)."""
+    """madmom RNN onset detection - sparse *main-beat* mode.
+    Targets melody/voice (playable density ~1.0-1.6/s) instead of every
+    16th.  Sensitivity still maps to density for future difficulty:
+    0.5=very sparse, 1.0=normal (playable), 2.0=dense.
+    Returns (beat_times, tempo)."""
     import numpy as _np
     from madmom.features.onsets import RNNOnsetProcessor, OnsetPeakPickingProcessor
     def prog(v):
         if progress_cb:
             try: progress_cb(v)
             except: pass
-    # sensitivity: higher -> catch more (lower threshold)
-    threshold = float(0.75 - 0.30 * max(0.0, min(2.0, sensitivity)))
+    s = max(0.2, min(2.0, float(sensitivity)))
+    # sparse main-beat params: higher threshold + larger combine + larger min_gap
+    # at s=1.0 -> th~0.55, comb~0.28, mg~0.38  => ~1.3/s (tested)
+    # at s=2.0 -> th~0.30, comb~0.10, mg~0.18 => ~3-4/s (dense for hard)
+    threshold = float(0.80 - 0.25 * s)          # 0.55 @1.0, 0.30 @2.0
+    threshold = max(0.28, min(0.75, threshold))
+    combine = float(0.40 - 0.12 * s)           # 0.28 @1.0, 0.16 @2.0
+    combine = max(0.05, min(0.40, combine))
+    min_gap = float(0.52 - 0.14 * s)           # 0.38 @1.0, 0.24 @2.0
+    min_gap = max(0.14, min(0.50, min_gap))
     prog(0.1)
     acts = RNNOnsetProcessor()(audio.astype(_np.float32, copy=False), sample_rate=sr)
     prog(0.8)
-    peak = OnsetPeakPickingProcessor(threshold=threshold, combine=0.05, fps=100)
+    peak = OnsetPeakPickingProcessor(threshold=threshold, combine=combine, fps=100)
     beats = [float(t) for t in peak(acts)]
-    # enforce a minimum gap so notes are physically tappable
-    min_gap = 0.14
     kept = []
     for t in beats:
         if not kept or t - kept[-1] >= min_gap:
@@ -462,15 +471,102 @@ def detect_beats_madmom(sr, audio, sensitivity=1.0, progress_cb=None):
     prog(1.0)
     return beats, float(bpm)
 
-def beatmap_from_times(times, duration):
-    """Build lane-assigned beatmap from a sorted list of beat times."""
+def _centroids_for_times(times, sr, audio):
+    """Spectral centroid per onset (pitch proxy). Returns list[float]."""
+    if sr is None or audio is None or not times:
+        return [0.0]*len(times)
+    cents = []
+    n = len(audio)
+    for t in times:
+        c = int(t*sr)
+        half = 1024
+        lo = max(0, c-half)
+        hi = min(n, c+half)
+        win = audio[lo:hi]
+        if len(win) < 256:
+            cents.append(0.0)
+            continue
+        # hann + zero-pad to 2048 for stable freq bins
+        w = np.hanning(len(win)).astype(np.float32)
+        win = (win * w).astype(np.float32)
+        N = 2048
+        if len(win) < N:
+            win = np.pad(win, (0, N-len(win)))
+        else:
+            win = win[:N]
+        spec = np.abs(np.fft.rfft(win))
+        freqs = np.fft.rfftfreq(N, 1.0/sr)
+        # log-compress like flux so centroid isn't dominated by loud bass
+        spec = np.log1p(spec*30.0)
+        s = np.sum(spec)
+        if s < 1e-6:
+            cents.append(0.0)
+        else:
+            cents.append(float(np.sum(freqs*spec)/s))
+    return cents
+
+def beatmap_from_times(times, duration, sr=None, audio=None):
+    """Build lane-assigned beatmap: pitch-aware + ergonomic.
+    - Spectral centroid (pitch) maps low->D, high->K so lane reflects melody.
+    - Quantile ranking ensures balanced lane use but preserves pitch order.
+    - Ergonomic: avoid same lane <0.35s, avoid same-hand repeats for close notes,
+      prefer opposite side for consecutive notes when pitch is ambiguous.
+    - For future difficulty: twin notes only on strong gaps (not for normal).
+    """
+    if not times:
+        return []
+    times = sorted(float(t) for t in times)
+    # pure fallback (no audio) -> ergonomic cycling
+    if sr is None or audio is None:
+        beatmap = []
+        last_used = {l: -999 for l in LANE_ORDER}
+        prev = None
+        for t in times:
+            # pick least-recently-used lane (round-robin with ergonomic gap)
+            cands = sorted(LANE_ORDER, key=lambda l: last_used[l])
+            chosen = cands[0]
+            # if same as prev and very close, pick next
+            if chosen == prev and cands[1] and t - last_used[chosen] < 0.45:
+                chosen = cands[1]
+            beatmap.append((float(t), chosen))
+            last_used[chosen] = t
+            prev = chosen
+        return sorted(beatmap, key=lambda x: x[0])
+
+    cents = _centroids_for_times(times, sr, audio)
+    # rank 0..1 (quantile) preserves pitch order while balancing lanes
+    order = np.argsort(cents)
+    rank = [0.0]*len(times)
+    for r, idx in enumerate(order):
+        rank[idx] = r / max(1, len(times)-1)
+
     beatmap = []
-    for idx, t in enumerate(times):
-        lane = LANE_ORDER[idx % 4]
-        beatmap.append((float(t), lane))
-        if idx % 16 == 7 and idx+1 < len(times) and times[idx+1] - t > 0.4:
-            other = LANE_ORDER[(LANE_ORDER.index(lane)+2)%4]
-            beatmap.append((float(t), other))
+    last_used = {l: -999.0 for l in LANE_ORDER}
+    prev = None
+    for i, t in enumerate(times):
+        pref_idx = int(rank[i]*4)
+        if pref_idx > 3: pref_idx = 3
+        # score each lane: pitch distance + ergonomic penalty
+        best_lane = None
+        best_score = 1e9
+        for ci, lane in enumerate(LANE_ORDER):
+            pitch_cost = abs(ci - pref_idx) * 1.0  # 0..3
+            # ergonomic: penalize recently used lane, strongly if same as prev
+            recency = t - last_used[lane]
+            repeat_cost = 0.0
+            if recency < 0.40:
+                repeat_cost += (0.40 - recency) * 6.0  # up to 2.4
+            if lane == prev and i>0 and t - times[i-1] < 0.55:
+                repeat_cost += 1.8  # discourage immediate repeat on close notes
+            # slight tie-breaker: prefer least-recently-used among equals
+            lru_bonus = - (recency * 0.02)  # older lane slightly preferred
+            score = pitch_cost + repeat_cost + lru_bonus
+            if score < best_score:
+                best_score = score
+                best_lane = lane
+        beatmap.append((float(t), best_lane))
+        last_used[best_lane] = t
+        prev = best_lane
     return sorted(beatmap, key=lambda x: x[0])
 
 def beats_from_media(media_path, sensitivity=1.0, use_librosa=True, progress_cb=None):
@@ -563,8 +659,13 @@ def beats_from_media(media_path, sensitivity=1.0, use_librosa=True, progress_cb=
             bpm = 128
             beat_interval = 60.0 / bpm
             times = [i * beat_interval for i in range(int(duration / beat_interval))]
-        beatmap = beatmap_from_times(times, duration)
-        beatmap = fill_beat_gaps(beatmap, float(duration), detected_bpm)
+        is_main = madmom_times is not None
+        if is_main:
+            beatmap = beatmap_from_times(times, duration, sr=sr_read, audio=audio)
+            beatmap = fill_beat_gaps(beatmap, float(duration), detected_bpm, sparse=True)
+        else:
+            beatmap = beatmap_from_times(times, duration)
+            beatmap = fill_beat_gaps(beatmap, float(duration), detected_bpm)
         prog(0.92)
         # also handle librosa return prog
         prog(1.0)
@@ -582,40 +683,45 @@ def beats_from_media(media_path, sensitivity=1.0, use_librosa=True, progress_cb=
         beatmap = [(i*interval, LANE_ORDER[i%4]) for i in range(int(duration/interval))]
         return beatmap, duration, bpm
 
-def fill_beat_gaps(beatmap, duration, tempo_hint=120):
-    """Fill large gaps (>1.6x avg interval) with interpolated beats so no silent sections."""
+def fill_beat_gaps(beatmap, duration, tempo_hint=120, sparse=False):
+    """Fill large gaps with interpolated beats. For sparse (main-beat) mode
+    gaps are left alone so rests stay rests - only extreme >2.5x gaps are
+    lightly filled, and no 0.5s grid fallback."""
     if not beatmap:
         return beatmap
-    # estimate avg interval from median
     import numpy as np
     times = [t for t,_ in beatmap]
     if len(times) < 2:
         return beatmap
     intervals = [times[i+1]-times[i] for i in range(len(times)-1)]
-    # use median for robustness
     try:
         avg = float(np.median(intervals))
     except:
         avg = 60.0/tempo_hint if tempo_hint>0 else 0.5
     if avg < 0.2: avg = 0.4
     if avg > 1.0: avg = 0.6
+    if sparse:
+        # main-beat: do not densify; keep rests. Only dedup.
+        dedup = []
+        for t,l in sorted(beatmap, key=lambda x: x[0]):
+            if dedup and abs(t-dedup[-1][0]) < 0.09:
+                continue
+            dedup.append((t,l))
+        return dedup
     filled = []
     for i in range(len(beatmap)):
         filled.append(beatmap[i])
         if i+1 < len(beatmap):
             gap = beatmap[i+1][0] - beatmap[i][0]
             if gap > avg*1.7 and gap < 4.0:
-                # fill gap with regular beats
                 n_fill = int(round(gap/avg)) - 1
                 if n_fill > 0 and n_fill < 8:
                     for k in range(1, n_fill+1):
                         t = beatmap[i][0] + avg*k
-                        # don't go too close to next
                         if t < beatmap[i+1][0] - 0.12:
                             lane = LANE_ORDER[(i+k) % 4]
                             filled.append((t, lane))
         elif beatmap[i][0] < duration - avg:
-            # tail gap to end
             gap = duration - beatmap[i][0]
             if gap > avg*1.7:
                 n_fill = int(round(gap/avg)) - 1
@@ -625,19 +731,15 @@ def fill_beat_gaps(beatmap, duration, tempo_hint=120):
                         lane = LANE_ORDER[(i+k) % 4]
                         filled.append((t, lane))
     filled = sorted(filled, key=lambda x: x[0])
-    # dedup close
     dedup = []
     for t,l in filled:
         if dedup and abs(t-dedup[-1][0]) < 0.09:
             continue
         dedup.append((t,l))
-    # if still sparse (< 0.8 beats per sec), add grid
     if len(dedup) < duration*0.8:
-        # fallback: add 2 beats per sec grid where gaps
         grid = []
         for i in range(int(duration*2)):
             t = i*0.5
-            # check if already close to existing
             if not any(abs(t-existing[0]) < 0.22 for existing in dedup):
                 grid.append((t, LANE_ORDER[i%4]))
         dedup = sorted(dedup+grid, key=lambda x: x[0])
