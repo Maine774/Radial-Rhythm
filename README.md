@@ -12,8 +12,10 @@ Beats fly from the **outside of the screen into the centre**. 4 colours, 4 keys:
 Hit the key when the beat reaches the centre ring.
 
 ## Features
-- **Demo pattern** when no song is provided — 16-bar pre-planned chart at 128 BPM to test mechanics.
-- **MP4 sync** — give it an `mp4` (or mp3/wav/mov/mkv) and it auto-generates a beatmap:
+- **Main Menu** → `PLAY DEMO` / `SONGS` / `QUIT`
+- **Songs folder** `./songs/` — drop mp4/mp3/wav/m4a/ogg/flac/mov/mkv there and pick from `SONGS` menu. Scans on entry, `R` to refresh.
+- **Demo pattern** when no song — 16-bar pre-planned chart at 128 BPM to test mechanics.
+- **MP4 sync** — give it an `mp4` (or any supported audio/video) and it auto-generates a beatmap:
   1. Extracts mono WAV with `ffmpeg`
   2. Runs lightweight onset detection with `numpy` (adaptive energy + peak picking).  
      If `librosa` is installed, it uses `librosa.beat.beat_track` for higher accuracy.
@@ -33,15 +35,25 @@ ffmpeg -version
 python main.py
 # or with a file directly:
 python main.py "C:\path\to\song.mp4"
+# putting files in songs/ is preferred:
+#   songs/my_song.mp4 -> appears in SONGS menu
 ```
 
+`_example_beats.wav` is included in `songs/` as a test tone so the menu isn't empty.
+
 ## Controls
-- `O` — open file dialog (mp4 / video / audio)
-- `SPACE` — play demo (no file) or play loaded media. Press again to pause.
-- `P` — play loaded media (alternative)
-- `D` `F` `J` `K` — hit (lowercase also works, key-repeat friendly)
-- `+` / `-` (or `[` `]`) — adjust sensitivity (more beats vs fewer) before re-loading file
-- `ESC` — quit
+### Menu
+- `UP/DOWN` or `W/S` navigate, `ENTER/SPACE` select, `ESC` quit
+- `O` open external file from anywhere
+
+### Songs browser
+- `UP/DOWN` or `W/S` select track, `ENTER/SPACE` play (analyses then starts)
+- `R` refresh folder scan, `B`/`ESC` back to menu, `O` open external
+
+### Playing
+- `D` `F` `J` `K` — hit (lowercase also works)
+- `SPACE` pause/resume, `ESC` → menu (stops music)
+- `+`/`-` or `[`/`]` adjust sensitivity (re-open song to apply) before loading
 
 Scoring: `PERFECT ±130ms` 300, `GOOD ±260ms` 150, `OK ±350ms` 50, else `MISS`. Combo multiplier `+25%` per 8 combo.
 
@@ -50,7 +62,7 @@ Scoring: `PERFECT ±130ms` 300, `GOOD ±260ms` 150, `OK ±350ms` 50, else `MISS`
 1. `extract_wav_with_ffmpeg()` -> 44.1k mono s16le
 2. `read_wav_mono()` -> float32 `[-1,1]`
 3. `detect_beats_energy()` -> RMS envelope per 512 hop, adaptive threshold `local_mean * 1.55 + local_std*0.35`, peak-pick with `180ms` min distance.
-4. Times mapped to lanes `LANE_ORDER[(idx*7 + int(t*2))%4]` with chord doubling every 16th beat.
+4. Times mapped to lanes `LANE_ORDER[idx%4]` cycling (with chord doubling every 16th beat) so all 4 colours appear.
 5. Fallback: if <8 onsets, generate 120 BPM grid.
 
 Tweak `sensitivity` (0.6–2.0) to shift threshold lower/higher.
@@ -58,12 +70,21 @@ Tweak `sensitivity` (0.6–2.0) to shift threshold lower/higher.
 ## File layout
 ```
 rhythmgame/
-  main.py          # full game (window, rendering, input, analysis)
+  main.py          # full game (window, states, rendering, input, analysis)
+  songs/           # put mp4/mp3/wav etc here
+    _example_beats.wav
+    _put_songs_here.txt
   requirements.txt
   README.md
 ```
 
 ## Troubleshooting
-- *No beats detected* -> increase sensitivity (`+` key) and reopen file, or install `librosa`.
+- *Label bold error* (pyglet 2.1) — fixed: uses `weight='bold'` not `bold=True`.
+- *No beats detected* -> increase sensitivity (`+`) and reopen file, or `pip install librosa`.
 - *Video shows black* -> audio still syncs; video texture display is not required for gameplay (progress bar + timer is authoritative).
 - *No tkinter dialog* -> falls back to console `input()` path prompt.
+- *Songs not appearing* -> check `songs/` exists next to `main.py`, use supported extensions, press `R` in Songs screen.
+
+## Fix log
+- Fixed `TypeError: Label.__init__() got an unexpected keyword argument 'bold'` and `_boxes` deallocator crash by switching to `weight='bold'`.
+- Added state machine `menu` / `song_select` / `playing` / `paused` / `results` and folder browser.
