@@ -25,6 +25,7 @@ import subprocess
 import wave
 import threading
 import hashlib
+import queue
 from pathlib import Path
 
 import pyglet
@@ -370,6 +371,7 @@ class RhythmGame(pyglet.window.Window):
         # cap max fps display
         self._fps_display = pyglet.window.FPSDisplay(self)
         self._fps_display.label.color = (120,120,130,180)
+        self.is_fullscreen = False
 
         # game state
         self.state = "menu"  # menu / song_select / playing / paused / results
@@ -536,6 +538,11 @@ class RhythmGame(pyglet.window.Window):
         self._av_frame_iter = None
         self._av_last_frame_image = None
         self._temp_audio_wav = None
+        self._av_frame_queue = queue.Queue(maxsize=4)
+        self._av_thread = None
+        self._av_thread_stop = threading.Event()
+        self._av_lock = threading.Lock()
+        self._av_latest_pts = 0.0
         self.analysis_progress = 0.0
         self.analysis_msg = ""
         self._analysis_done = False
@@ -746,6 +753,78 @@ class RhythmGame(pyglet.window.Window):
             self._analysis_path = path
             self._analysis_autoplay = False
 
+    def _av_thread_func(self):
+        # background thread: decode video at 30fps, push to queue
+        try:
+            if not self._av_container or not self._av_video_stream:
+                # try to find stream
+                if self._av_container:
+                    for s in self._av_container.streams:
+                        if s.type == 'video':
+                            self._av_video_stream = s
+                            break
+                if not self._av_video_stream:
+                    return
+            # seek to start
+            try:
+                self._av_container.seek(0)
+            except: pass
+            frame_iter = self._av_container.decode(video=0)
+            while not self._av_thread_stop.is_set() and self.is_playing and self.is_media_mode:
+                try:
+                    frame = next(frame_iter)
+                    # scale to 320 for perf
+                    if frame.width > 320:
+                        try:
+                            h = int(320 * frame.height / frame.width)
+                            frame = frame.reformat(width=320, height=h, format='rgb24')
+                        except:
+                            pass
+                    arr = frame.to_ndarray(format='rgb24')
+                    pts = float(frame.pts * self._av_video_stream.time_base) if frame.pts is not None else 0
+                    # put in queue, drop oldest if full
+                    try:
+                        if self._av_frame_queue.full():
+                            try:
+                                self._av_frame_queue.get_nowait()
+                            except: pass
+                        self._av_frame_queue.put_nowait((arr, frame.width, frame.height, pts))
+                    except:
+                        pass
+                    # pace to ~30fps
+                    time.sleep(1/30.0)
+                except StopIteration:
+                    # loop video
+                    try:
+                        self._av_container.seek(0)
+                        frame_iter = self._av_container.decode(video=0)
+                    except:
+                        break
+                except Exception as e:
+                    time.sleep(0.02)
+                    continue
+        except Exception as e:
+            print(f"[av thread] {e}")
+
+    def _start_av_thread(self):
+        self._stop_av_thread()
+        self._av_thread_stop.clear()
+        while not self._av_frame_queue.empty():
+            try:
+                self._av_frame_queue.get_nowait()
+            except: pass
+        self._av_thread = threading.Thread(target=self._av_thread_func, daemon=True)
+        self._av_thread.start()
+
+    def _stop_av_thread(self):
+        try:
+            self._av_thread_stop.set()
+        except: pass
+        try:
+            while not self._av_frame_queue.empty():
+                self._av_frame_queue.get_nowait()
+        except: pass
+
     def load_media(self, path, autoplay=False):
         if not os.path.exists(path):
             self.feedback_text = f"File not found: {path}"
@@ -834,16 +913,11 @@ class RhythmGame(pyglet.window.Window):
                 self.start_time = time.time()
             except Exception as e:
                 print(f"player play failed {e}")
-        # setup AV video for background (seek to 0)
+        # start AV video thread for 30fps background
         if getattr(self, '_av_container', None) and getattr(self, '_av_video_stream', None):
-            try:
-                self._av_container.seek(0)
-                # recreate iterator
-                self._av_frame_iter = self._av_container.decode(video=0)
-                self._av_last_frame_image = None
-                self._video_sprite = None
-            except Exception as e:
-                print(f"[video] seek failed {e}")
+            self._av_last_frame_image = None
+            self._video_sprite = None
+            self._start_av_thread()
         self.feedback_text = "PLAYING"
         self.feedback_color = (74, 255, 138, 255)
         self.feedback_time = time.time()
@@ -907,12 +981,34 @@ class RhythmGame(pyglet.window.Window):
         if not self.is_playing:
             return
         song_t = self.get_song_time()
-        # update AV video frame for mp4 background (8fps, scaled for perf) - 60fps target
+        # update AV video from background thread (30fps) - main thread only does texture upload
+        if getattr(self, '_av_container', None) and self.is_media_mode and self.is_playing:
+            try:
+                latest = None
+                while not self._av_frame_queue.empty():
+                    try:
+                        latest = self._av_frame_queue.get_nowait()
+                    except:
+                        break
+                if latest is not None:
+                    arr, w, h, pts = latest
+                    img = pyglet.image.ImageData(w, h, 'RGB', arr.tobytes(), pitch=-w*3)
+                    self._av_last_frame_image = img.get_texture()
+            except:
+                pass
+        elif getattr(self, '_av_thread', None) and self._av_thread.is_alive():
+            self._stop_av_thread()
+        # legacy disabled
+        if False and getattr(self, '_av_container', None) and getattr(self, '_av_video_stream', None) and self.is_media_mode:
+            try:
+                if not hasattr(self, '_av_last_video_time'):
+                    self._av_last_video_time = -999
+                if song_t - self._av_last_video_time >= 1/30.0:
         if getattr(self, '_av_container', None) and getattr(self, '_av_video_stream', None) and self.is_media_mode:
             try:
                 if not hasattr(self, '_av_last_video_time'):
                     self._av_last_video_time = -999
-                if song_t - self._av_last_video_time >= 1/8.0:
+                if song_t - self._av_last_video_time >= 1/30.0:
                     if self._av_frame_iter is None:
                         try:
                             self._av_container.seek(0)
@@ -924,10 +1020,12 @@ class RhythmGame(pyglet.window.Window):
                     if self._av_frame_iter is not None:
                         try:
                             frame = next(self._av_frame_iter)
-                            # scale down for perf (1280->640)
-                            if frame.width > 640:
+                            # scale down to 160 for 30fps perf (16x faster than 1280)
+                            if frame.width > 160:
                                 try:
-                                    frame = frame.reformat(width=640, height=360, format='rgb24')
+                                    # keep aspect
+                                    h = int(160 * frame.height / frame.width)
+                                    frame = frame.reformat(width=160, height=h, format='rgb24')
                                 except:
                                     pass
                             arr = frame.to_ndarray(format='rgb24')
@@ -939,9 +1037,10 @@ class RhythmGame(pyglet.window.Window):
                                 self._av_container.seek(0)
                                 self._av_frame_iter = self._av_container.decode(video=0)
                                 frame = next(self._av_frame_iter)
-                                if frame.width > 640:
+                                if frame.width > 160:
                                     try:
-                                        frame = frame.reformat(width=640, height=360, format='rgb24')
+                                        h = int(160 * frame.height / frame.width)
+                                        frame = frame.reformat(width=160, height=h, format='rgb24')
                                     except:
                                         pass
                                 arr = frame.to_ndarray(format='rgb24')
@@ -1063,6 +1162,22 @@ class RhythmGame(pyglet.window.Window):
     # Input
     # --------------------------------------------------------
     def on_key_press(self, symbol, modifiers):
+        # Global F11 for fullscreen
+        if symbol == key.F11:
+            self.is_fullscreen = not self.is_fullscreen
+            try:
+                self.set_fullscreen(self.is_fullscreen)
+            except:
+                pass
+            return
+        # ESC exits fullscreen first
+        if symbol == key.ESCAPE and self.is_fullscreen:
+            self.is_fullscreen = False
+            try:
+                self.set_fullscreen(False)
+            except:
+                pass
+            return
         # Global F1 for FPS toggle
         if symbol == key.F1:
             self.show_fps = not self.show_fps
@@ -1477,6 +1592,16 @@ class RhythmGame(pyglet.window.Window):
         self._beat_last_count = pool_idx
 
     def _draw_hud(self, song_t):
+        # update for fullscreen (dynamic size)
+        self._hud_top_bar.width = self.width
+        self._hud_top_bar.y = self.height - 46
+        self._hud_score_lbl.y = self.height - 16
+        self._hud_hits_lbl.y = self.height - 33
+        self._hud_time_lbl.y = self.height - 18
+        self._hud_mode_lbl.y = self.height - 32
+        self._hud_prog_bg.width = self.width
+        self._hud_prog_bg.y = 6
+        self._hud_prog_fg.y = 6
         # reuse persistent HUD shapes/labels - zero alloc, only update if changed
         self._hud_top_bar.draw()
         # score - only update text if changed to avoid layout rebuild
@@ -1491,7 +1616,9 @@ class RhythmGame(pyglet.window.Window):
         if self.is_playing:
             prog = song_t / self.duration if self.duration else 0
             prog = max(0, min(1, prog))
-            pw = int(WINDOW_W * prog)
+            pw = int(self.width * prog)
+            # update bg width for fullscreen
+            self._hud_prog_bg.width = self.width
             self._hud_prog_bg.draw()
             if self._hud_prog_fg.width != pw:
                 self._hud_prog_fg.width = pw
@@ -1499,18 +1626,22 @@ class RhythmGame(pyglet.window.Window):
             new_time = f"{int(song_t//60):01d}:{int(song_t%60):02d} / {int(self.duration//60):01d}:{int(self.duration%60):02d}"
             if self._hud_time_lbl.text != new_time:
                 self._hud_time_lbl.text = new_time
+            # keep time label at right edge for fullscreen
+            self._hud_time_lbl.x = self.width - 12
             self._hud_time_lbl.draw()
+            self._hud_mode_lbl.x = self.width - 12
         else:
             mode = f"Media: {Path(self.media_path).name}" if self.media_path else "DEMO MODE"
             if self._hud_mode_lbl.text != mode:
                 self._hud_mode_lbl.text = mode
+            self._hud_mode_lbl.x = self.width - 12
             self._hud_mode_lbl.draw()
         if self.feedback_text and (time.time() - self.feedback_time) < 1.6:
             age = time.time() - self.feedback_time
             alpha = int(255 * (1 - age/1.6))
             alpha = max(0, min(255, alpha))
             scale = 1.0 + max(0, 0.25 - age*0.5)
-            cx, cy = CENTER
+            cx, cy = self.width // 2, self.height // 2
             fsize = 28 if "PERFECT" in self.feedback_text else 24
             self._hud_feedback_lbl.text = self.feedback_text
             self._hud_feedback_lbl.font_size = fsize
@@ -1543,7 +1674,7 @@ class RhythmGame(pyglet.window.Window):
                     else:
                         if self._video_sprite.image != tex:
                             self._video_sprite.image = tex
-                    scale = max(WINDOW_W / tex.width, WINDOW_H / tex.height)
+                    scale = max(self.width / tex.width, self.height / tex.height)
                     self._video_sprite.scale = scale
                     new_w = tex.width * scale
                     new_h = tex.height * scale
@@ -1551,7 +1682,7 @@ class RhythmGame(pyglet.window.Window):
                     self._video_sprite.y = (WINDOW_H - new_h) // 2
                     self._video_sprite.opacity = 110
                     self._video_sprite.draw()
-                    overlay = pyglet.shapes.Rectangle(0, 0, WINDOW_W, WINDOW_H, color=(6, 6, 14))
+                    overlay = pyglet.shapes.Rectangle(0, 0, self.width, self.height, color=(6, 6, 14))
                     overlay.opacity = 140
                     overlay.draw()
                     return True
@@ -1589,25 +1720,25 @@ class RhythmGame(pyglet.window.Window):
                 pass
         # Scale to cover window (like CSS background-size: cover)
         try:
-            scale = max(WINDOW_W / tex.width, WINDOW_H / tex.height)
+            scale = max(self.width / tex.width, self.height / tex.height)
             self._video_sprite.scale = scale
             # need to set scale before position? sprite scale affects width/height
             new_w = tex.width * scale
             new_h = tex.height * scale
-            self._video_sprite.x = (WINDOW_W - new_w) // 2
-            self._video_sprite.y = (WINDOW_H - new_h) // 2
+            self._video_sprite.x = (self.width - new_w) // 2
+            self._video_sprite.y = (self.height - new_h) // 2
             self._video_sprite.opacity = 110  # dim so game visible
             self._video_sprite.draw()
             # dim overlay for readability
-            overlay = pyglet.shapes.Rectangle(0, 0, WINDOW_W, WINDOW_H, color=(6, 6, 14))
+            overlay = pyglet.shapes.Rectangle(0, 0, self.width, self.height, color=(6, 6, 14))
             overlay.opacity = 140
             overlay.draw()
             return True
         except Exception as e:
             # fallback blit
             try:
-                tex.blit(0, 0, width=WINDOW_W, height=WINDOW_H)
-                overlay = pyglet.shapes.Rectangle(0, 0, WINDOW_W, WINDOW_H, color=(6, 6, 14))
+                tex.blit(0, 0, width=self.width, height=self.height)
+                overlay = pyglet.shapes.Rectangle(0, 0, self.width, self.height, color=(6, 6, 14))
                 overlay.opacity = 140
                 overlay.draw()
                 return True
@@ -1616,10 +1747,12 @@ class RhythmGame(pyglet.window.Window):
 
     def on_draw(self):
         self.clear()
-        cx, cy = CENTER
+        # dynamic center for fullscreen
+        cx, cy = self.width // 2, self.height // 2
+        # also handle video background scaling via self.width/height
         if self.state in ("playing", "paused", "results"):
             # video background for MP4 (behind everything)
-            if self.state == "playing" and self.is_media_mode:
+            if self.state in ("playing", "paused") and self.is_media_mode:
                 self._draw_video_background()
             # game bg - update batched shapes
             pulse = self.hit_pulse
@@ -1735,6 +1868,11 @@ class RhythmGame(pyglet.window.Window):
             return
 
         if self.state == "menu":
+            # update for fullscreen (dynamic center)
+            self._menu_title_lbl.x = self.width // 2
+            self._menu_sub_lbl.x = self.width // 2
+            self._menu_songs_hint_lbl.x = self.width // 2
+            self._menu_footer_lbl.x = self.width // 2
             # title - persistent
             self._menu_title_lbl.draw()
             self._menu_sub_lbl.draw()
@@ -1743,12 +1881,18 @@ class RhythmGame(pyglet.window.Window):
 
             # menu options as boxes - reuse persistent shapes (no alloc)
             for idx, opt in enumerate(self.menu_options):
-                y = 360 - idx*60
+                y = 360 - idx*60 + (self.height - WINDOW_H)//2
                 selected = idx == self.menu_index
                 bg = self._menu_bg_rects[idx]
+                bg.x = self.width // 2 - 210
+                bg.y = y - 22
                 bg.color = (55, 55, 90) if selected else (28, 28, 42)
                 border = self._menu_border_rects[idx]
+                border.x = self.width // 2 - 211
+                border.y = y - 23
                 accent = self._menu_accent_rects[idx]
+                accent.x = self.width // 2 - 210
+                accent.y = y - 22
                 # draw order: border behind, bg, accent
                 if selected:
                     border.visible = True
@@ -1771,12 +1915,14 @@ class RhythmGame(pyglet.window.Window):
 
             # footer - persistent
             self._menu_footer_lbl.draw()
-            # lane legend - reuse persistent circles/labels
+            # lane legend - reuse persistent circles/labels (dynamic for fullscreen)
             for i, lane in enumerate(LANE_ORDER):
                 c = self._menu_lane_circles[i]
+                xs = self.width // 2 - 160 + i*90
+                c.x = xs + 16
+                c.y = 30
                 c.draw()
                 lbl = self._menu_lane_lbls[i]
-                xs = WINDOW_W//2 - 160 + i*90
                 lbl.x = xs+34
                 lbl.y = 30
                 lbl.text = lane.upper()
@@ -1854,6 +2000,9 @@ class RhythmGame(pyglet.window.Window):
 
     def on_close(self):
         # cleanup AV and temp wav
+        try:
+            self._stop_av_thread()
+        except: pass
         try:
             if getattr(self, '_av_container', None):
                 try:
