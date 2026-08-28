@@ -273,9 +273,14 @@ def beats_from_media(media_path, sensitivity=1.0, use_librosa=True):
 # ------------------------------------------------------------
 class RhythmGame(pyglet.window.Window):
     def __init__(self):
-        super().__init__(width=WINDOW_W, height=WINDOW_H, caption="Radial Rhythm - Pyglet  |  Main Menu", resizable=False)
+        super().__init__(width=WINDOW_W, height=WINDOW_H, caption="Radial Rhythm - Pyglet  |  Main Menu", resizable=False, vsync=True)
         self.batch = pyglet.graphics.Batch()
+        # Batch for shapes to reduce draw calls
+        self.shape_batch = pyglet.graphics.Batch()
         pyglet.gl.glClearColor(10/255, 10/255, 18/255, 1.0)
+        # cap max fps display
+        self._fps_display = pyglet.window.FPSDisplay(self)
+        self._fps_display.label.color = (120,120,130,180)
 
         # game state
         self.state = "menu"  # menu / song_select / playing / paused / results
@@ -314,7 +319,127 @@ class RhythmGame(pyglet.window.Window):
         self.beatmap = self.demo_beatmap
         self.duration = self.demo_beatmap[-1][0] + 2.0 if self.demo_beatmap else 30.0
 
-        pyglet.clock.schedule_interval(self.update, 1/120)
+        # label cache for performance (reuse Label objects to avoid glyph rebuild)
+        self._label_cache = {}
+        self._last_key_hit = 0
+        self._last_refresh = 0
+        self.show_fps = False
+        # for vsync / 60fps
+        pyglet.clock.schedule_interval(self.update, 1/60)
+
+        # ---- pooled shapes for 60fps (reuse + batch) ----
+        self.game_batch = pyglet.graphics.Batch()
+        self._lane_line_shapes = {}
+        self._lane_outer_bg_shapes = {}
+        self._lane_outer_shapes = {}
+        cx, cy = CENTER
+        for lane_key, info in LANES.items():
+            ang = math.radians(info['angle'])
+            x1 = cx + math.cos(ang) * TARGET_RADIUS
+            y1 = cy + math.sin(ang) * TARGET_RADIUS
+            x2 = cx + math.cos(ang) * SPAWN_RADIUS
+            y2 = cy + math.sin(ang) * SPAWN_RADIUS
+            col = info['color']
+            self._lane_line_shapes[lane_key] = pyglet.shapes.Line(x1, y1, x2, y2, thickness=2, color=(*col, 60), batch=self.game_batch)
+            sx = cx + math.cos(ang) * SPAWN_RADIUS
+            sy = cy + math.sin(ang) * SPAWN_RADIUS
+            self._lane_outer_bg_shapes[lane_key] = pyglet.shapes.Circle(sx, sy, 14, color=(*col, 90), batch=self.game_batch)
+            self._lane_outer_shapes[lane_key] = pyglet.shapes.Circle(sx, sy, 10, color=col, batch=self.game_batch)
+        # center target pooled (batched) - hide non-essential for 60fps
+        self._center_shadow1 = pyglet.shapes.Circle(cx, cy, TARGET_RADIUS+18, color=(30,30,45), batch=self.game_batch)
+        self._center_shadow1.opacity = 90
+        self._center_shadow1.visible = False
+        self._center_shadow2 = pyglet.shapes.Circle(cx, cy, TARGET_RADIUS+8, color=(50,50,75), batch=self.game_batch)
+        self._center_shadow2.opacity = 90
+        self._center_shadow2.visible = False
+        self._center_outer = pyglet.shapes.Circle(cx, cy, TARGET_RADIUS, color=(255,255,255), batch=self.game_batch)
+        self._center_outer.opacity = 30
+        self._center_main = pyglet.shapes.Circle(cx, cy, TARGET_RADIUS, color=(22,22,34), batch=self.game_batch)
+        self._center_inner = pyglet.shapes.Circle(cx, cy, TARGET_RADIUS-6, color=(40,40,60), batch=self.game_batch)
+        self._center_inner.opacity = 200
+        self._center_inner.visible = False
+        self._center_dot = pyglet.shapes.Circle(cx, cy, 8, color=(255,255,255), batch=self.game_batch)
+        self._center_dot.opacity = 180
+        self._center_lane_dots = {}
+        self._center_lane_glows = {}
+        for lane_key, info in LANES.items():
+            col = info['color']
+            self._center_lane_dots[lane_key] = pyglet.shapes.Circle(cx, cy, 16, color=col, batch=self.game_batch)
+            self._center_lane_glows[lane_key] = pyglet.shapes.Circle(cx, cy, 28, color=col, batch=self.game_batch)
+            self._center_lane_glows[lane_key].opacity = 0
+            self._center_lane_glows[lane_key].visible = False
+        # beat pool: 36 beats max visible (batched) - use visible False to skip batch draw
+        self._beat_pool = []
+        for _ in range(36):
+            circ = pyglet.shapes.Circle(0, 0, 22, color=(255,255,255), batch=self.game_batch)
+            circ.visible = False
+            inner = pyglet.shapes.Circle(0, 0, 12, color=(255,255,255), batch=self.game_batch)
+            inner.visible = False
+            tail = pyglet.shapes.Line(0, 0, 0, 0, thickness=8, color=(255,255,255,90), batch=self.game_batch)
+            tail.visible = False
+            hit_circ = pyglet.shapes.Circle(0, 0, 28, color=(255,255,255), batch=self.game_batch)
+            hit_circ.visible = False
+            self._beat_pool.append({'circle': circ, 'inner': inner, 'tail': tail, 'hit': hit_circ, 'in_use': False})
+
+        # ---- persistent labels for 60fps (avoid _draw_label cache lookup per frame) ----
+        self._lane_text_labels = {}
+        for lane_key, info in LANES.items():
+            ang = math.radians(info['angle'])
+            sx = cx + math.cos(ang) * SPAWN_RADIUS
+            sy = cy + math.sin(ang) * SPAWN_RADIUS
+            lbl = pyglet.text.Label(info['label'], x=sx, y=sy, font_name='Arial', font_size=11, weight='bold', color=(255,255,255,255), anchor_x='center', anchor_y='center')
+            self._lane_text_labels[lane_key] = lbl
+        # HUD persistent labels
+        self._hud_score_lbl = pyglet.text.Label("", x=16, y=WINDOW_H-16, font_name='Arial', font_size=14, weight='bold', color=(240,240,255,255), anchor_x='left', anchor_y='top')
+        self._hud_hits_lbl = pyglet.text.Label("", x=16, y=WINDOW_H-33, font_name='Consolas', font_size=11, color=(180,180,200,255), anchor_x='left', anchor_y='top')
+        self._hud_time_lbl = pyglet.text.Label("", x=WINDOW_W-12, y=WINDOW_H-18, font_name='Consolas', font_size=10, color=(180,220,255,255), anchor_x='right', anchor_y='top')
+        self._hud_mode_lbl = pyglet.text.Label("", x=WINDOW_W-12, y=WINDOW_H-32, font_name='Consolas', font_size=10, color=(150,170,200,255), anchor_x='right', anchor_y='top')
+        self._hud_feedback_lbl = pyglet.text.Label("", x=CENTER[0], y=CENTER[1]+110, font_name='Arial', font_size=24, weight='bold', color=(255,255,255,255), anchor_x='center', anchor_y='center')
+        self._hud_instr_lbl = pyglet.text.Label("", x=WINDOW_W//2, y=18, font_name='Consolas', font_size=9, color=(130,130,160,255), anchor_x='center', anchor_y='center')
+        # HUD shapes (reuse)
+        self._hud_top_bar = pyglet.shapes.Rectangle(0, WINDOW_H-46, WINDOW_W, 46, color=(18,18,30))
+        self._hud_top_bar.opacity = 220
+        self._hud_prog_bg = pyglet.shapes.Rectangle(0, 6, WINDOW_W, 4, color=(40,40,50))
+        self._hud_prog_fg = pyglet.shapes.Rectangle(0, 6, 0, 4, color=(100,255,160))
+
+        # ---- persistent menu shapes for 60fps ----
+        self._menu_batch = pyglet.graphics.Batch()
+        self._menu_bg_rects = []
+        self._menu_border_rects = []
+        self._menu_accent_rects = []
+        for idx in range(3):
+            y = 360 - idx*60
+            x = WINDOW_W//2
+            w, h = 420, 44
+            bg = pyglet.shapes.Rectangle(x - w//2, y - h//2, w, h, color=(28,28,42))
+            border = pyglet.shapes.Rectangle(x - w//2 -1, y - h//2 -1, w+2, h+2, color=(120,180,255))
+            accent = pyglet.shapes.Rectangle(x - w//2, y - h//2, 6, h, color=(100,255,160))
+            border.visible = False
+            accent.visible = False
+            self._menu_bg_rects.append(bg)
+            self._menu_border_rects.append(border)
+            self._menu_accent_rects.append(accent)
+        self._menu_lane_circles = []
+        for i, lane in enumerate(LANE_ORDER):
+            col = LANES[lane]['color']
+            xs = WINDOW_W//2 - 160 + i*90
+            c = pyglet.shapes.Circle(xs+16, 30, 10, color=col)
+            self._menu_lane_circles.append(c)
+        # persistent menu labels (3 options + static texts)
+        self._menu_title_lbl = pyglet.text.Label("RADIAL RHYTHM", x=WINDOW_W//2, y=WINDOW_H - 120, font_name='Arial', font_size=40, weight='bold', color=(255,255,255,255), anchor_x='center', anchor_y='center')
+        self._menu_sub_lbl = pyglet.text.Label("beats converge to the centre  •  D  F  J  K", x=WINDOW_W//2, y=WINDOW_H - 155, font_name='Consolas', font_size=11, color=(140,200,255,255), anchor_x='center', anchor_y='center')
+        self._menu_songs_hint_lbl = pyglet.text.Label("", x=WINDOW_W//2, y=WINDOW_H - 180, font_name='Consolas', font_size=9, color=(130,140,160,255), anchor_x='center', anchor_y='center')
+        self._menu_option_lbls = []
+        for opt in self.menu_options:
+            lbl = pyglet.text.Label(opt, x=WINDOW_W//2, y=0, font_name='Arial', font_size=16, weight='bold', color=(220,220,240,255), anchor_x='center', anchor_y='center')
+            self._menu_option_lbls.append(lbl)
+        self._menu_footer_lbl = pyglet.text.Label("UP/DOWN or W/S • ENTER/SPACE to select • O open external file • ESC quit", x=WINDOW_W//2, y=70, font_name='Consolas', font_size=9, color=(110,120,150,255), anchor_x='center', anchor_y='center')
+        self._menu_lane_lbls = []
+        for lane in LANE_ORDER:
+            lbl = pyglet.text.Label(lane.upper(), x=0, y=30, font_name='Consolas', font_size=9, color=(200,200,220,255), anchor_x='left', anchor_y='center')
+            self._menu_lane_lbls.append(lbl)
+        # song select persistent
+        self._song_panel = pyglet.shapes.Rectangle(200, 100, 880, 460, color=(18,18,30))
 
     # ---------- helpers ----------
     def refresh_song_list(self):
@@ -494,6 +619,11 @@ class RhythmGame(pyglet.window.Window):
                     self.lane_flash[k] = max(0, self.lane_flash[k] - dt*3)
             if self.hit_pulse > 0:
                 self.hit_pulse = max(0, self.hit_pulse - dt*4)
+            # keep song count fresh in menu/song_select (without IO every frame)
+            if self.state in ("menu", "song_select"):
+                if not hasattr(self, '_last_refresh') or time.time() - self._last_refresh > 1.5:
+                    self.song_files = get_songs_in_folder()
+                    self._last_refresh = time.time()
             return
         if not self.is_playing:
             return
@@ -505,9 +635,11 @@ class RhythmGame(pyglet.window.Window):
             if not b['hit'] and delta > HIT_WINDOW_OK:
                 self.hits['miss'] += 1
                 self.combo = 0
-                self.feedback_text = "MISS"
-                self.feedback_color = (255, 80, 80, 255)
-                self.feedback_time = time.time()
+                # don't overwrite a recent hit's feedback (e.g., PERFECT) immediately
+                if time.time() - self.feedback_time > 0.35 or self.feedback_text == "MISS":
+                    self.feedback_text = "MISS"
+                    self.feedback_color = (255, 80, 80, 255)
+                    self.feedback_time = time.time()
                 self.lane_flash[b['lane']] = 1.0
                 continue
             if delta > 1.0 and b['hit']:
@@ -575,8 +707,9 @@ class RhythmGame(pyglet.window.Window):
             self.feedback_text = "OK"
             self.feedback_color = (100, 200, 255, 255)
         else:
-            self.hits['miss'] += 1
-            self.combo = 0
+            # too far - don't double-count miss (update will count timeout)
+            # just show MISS feedback without incrementing miss yet
+            self.combo = max(0, self.combo - 1)
             self.feedback_text = "MISS"
             self.feedback_color = (255, 80, 80, 255)
             self.feedback_time = time.time()
@@ -595,6 +728,10 @@ class RhythmGame(pyglet.window.Window):
     # Input
     # --------------------------------------------------------
     def on_key_press(self, symbol, modifiers):
+        # Global F1 for FPS toggle
+        if symbol == key.F1:
+            self.show_fps = not self.show_fps
+            return
         # Global O for open
         if symbol == key.O:
             # allow opening from any state
@@ -730,6 +867,7 @@ class RhythmGame(pyglet.window.Window):
                 return
             if symbol in KEY_TO_LANE:
                 lane = KEY_TO_LANE[symbol]
+                self._last_key_hit = time.time()
                 self.try_hit(lane)
                 return
 
@@ -769,10 +907,19 @@ class RhythmGame(pyglet.window.Window):
         # lane hits as text fallback for paused/menu etc handled via on_text
 
     def on_text(self, text):
-        if self.state == "playing":
-            t = text.lower()
-            if t in CHAR_TO_LANE:
-                self.try_hit(CHAR_TO_LANE[t])
+        # Disabled: lane hits are handled in on_key_press to avoid double trigger
+        # which caused PERFECT to be immediately overwritten by MISS.
+        # Keep for fallback only if not handled via key symbol (e.g., IME).
+        # Only process if no recent key hit (debounce 30ms)
+        if self.state != "playing":
+            return
+        # If we already handled via on_key_press, ignore duplicate.
+        # Check last hit time to debounce.
+        if hasattr(self, '_last_key_hit') and time.time() - self._last_key_hit < 0.05:
+            return
+        t = text.lower()
+        if t in CHAR_TO_LANE:
+            self.try_hit(CHAR_TO_LANE[t])
 
     def on_mouse_press(self, x, y, button, modifiers):
         # simple click handling for menu / song select
@@ -804,88 +951,138 @@ class RhythmGame(pyglet.window.Window):
     # Drawing helpers
     # --------------------------------------------------------
     def _draw_label(self, text, x, y, size=12, color=(255,255,255,255), anchor_x='left', anchor_y='baseline', font_name='Arial', weight='normal', italic=False):
-        # Wrapper to avoid bold kwarg issue
-        lbl = pyglet.text.Label(text, x=x, y=y, font_name=font_name, font_size=size, weight=weight, italic=italic, color=color, anchor_x=anchor_x, anchor_y=anchor_y)
+        # Wrapper to avoid bold kwarg issue + cache for 60fps performance
+        # Reuse Label objects per style key to avoid glyph rebuild each frame
+        key = (font_name, int(size*10), weight, italic, anchor_x, anchor_y)
+        lbl = self._label_cache.get(key)
+        if lbl is None:
+            lbl = pyglet.text.Label(text, x=x, y=y, font_name=font_name, font_size=size, weight=weight, italic=italic, color=color, anchor_x=anchor_x, anchor_y=anchor_y)
+            self._label_cache[key] = lbl
+        else:
+            # update in-place; pyglet handles layout invalidation
+            if lbl.text != text:
+                lbl.text = text
+            lbl.x = x
+            lbl.y = y
+            # font changes are rare; only set if different
+            if lbl.font_name != font_name:
+                lbl.font_name = font_name
+            if lbl.font_size != size:
+                lbl.font_size = size
+            if lbl.weight != weight:
+                lbl.weight = weight
+            if lbl.italic != italic:
+                lbl.italic = italic
+            if lbl.color != color:
+                lbl.color = color
+            # anchor changes require recreate? pyglet allows set
+            if lbl.anchor_x != anchor_x:
+                lbl.anchor_x = anchor_x
+            if lbl.anchor_y != anchor_y:
+                lbl.anchor_y = anchor_y
         lbl.draw()
         return lbl
 
     def _draw_center_target(self, cx, cy, pulse):
+        # Fast idle check - skip all if no pulse/flash (common case)
+        max_flash = max(self.lane_flash.values()) if self.lane_flash else 0
+        if pulse < 0.01 and max_flash < 0.01:
+            # ensure hidden shadows stay hidden, but skip updates
+            return
+        # Optimized: only update if flash/pulse changed (saves ~70% updates when idle)
+        if not hasattr(self, '_center_last_pulse'):
+            self._center_last_pulse = -1
+            self._center_last_flash = {k: -1 for k in LANES}
+        # keep essential visible
+        self._center_shadow1.visible = False
+        self._center_shadow2.visible = False
+        self._center_inner.visible = False
+        self._center_main.visible = True
+        if abs(pulse - self._center_last_pulse) > 0.005:
+            pulse_r = TARGET_RADIUS + pulse * 22
+            self._center_outer.radius = int(pulse_r)
+            self._center_outer.opacity = int(30 + pulse*40)
+            self._center_dot.radius = 8 + pulse*6
+            self._center_last_pulse = pulse
         for lane_key, info in LANES.items():
-            ang = math.radians(info['angle'])
-            x1 = cx + math.cos(ang) * TARGET_RADIUS
-            y1 = cy + math.sin(ang) * TARGET_RADIUS
-            x2 = cx + math.cos(ang) * SPAWN_RADIUS
-            y2 = cy + math.sin(ang) * SPAWN_RADIUS
-            col = info['color']
             flash = self.lane_flash[lane_key]
+            last = self._center_last_flash[lane_key]
+            if abs(flash - last) < 0.015 and flash < 0.015:
+                continue
+            self._center_last_flash[lane_key] = flash
+            col = info['color']
             alpha = 60 + int(flash * 180)
             alpha = min(255, alpha)
             width = 2 + flash * 4
-            line = pyglet.shapes.Line(x1, y1, x2, y2, thickness=width, color=(*col, alpha))
-            line.draw()
-            sx = cx + math.cos(ang) * SPAWN_RADIUS
-            sy = cy + math.sin(ang) * SPAWN_RADIUS
-            sc = pyglet.shapes.Circle(sx, sy, 14 + flash*6, color=(*col, 90))
-            sc.opacity = 90 + int(flash*100)
-            sc.draw()
-            outer = pyglet.shapes.Circle(sx, sy, 10, color=col)
-            outer.draw()
-            # label - fixed bold issue
-            self._draw_label(info['label'], x=sx, y=sy, size=11, color=(255,255,255,255), anchor_x='center', anchor_y='center', weight='bold')
-        for r, col in [(TARGET_RADIUS+18, (30,30,45)), (TARGET_RADIUS+8, (50,50,75))]:
-            c = pyglet.shapes.Circle(cx, cy, r, color=col)
-            c.opacity = 90
-            c.draw()
-        pulse_r = TARGET_RADIUS + pulse * 22
-        c_outer = pyglet.shapes.Circle(cx, cy, int(pulse_r), color=(255,255,255))
-        c_outer.opacity = int(30 + pulse*40)
-        c_outer.draw()
-        c_main = pyglet.shapes.Circle(cx, cy, TARGET_RADIUS, color=(22,22,34))
-        c_main.draw()
-        inner = pyglet.shapes.Circle(cx, cy, TARGET_RADIUS-6, color=(40,40,60))
-        inner.opacity = 200
-        inner.draw()
-        dot = pyglet.shapes.Circle(cx, cy, 8 + pulse*6, color=(255,255,255))
-        dot.opacity = 180
-        dot.draw()
-        for lane_key, info in LANES.items():
-            ang = math.radians(info['angle'])
-            ex = cx + math.cos(ang) * TARGET_RADIUS
-            ey = cy + math.sin(ang) * TARGET_RADIUS
-            flash = self.lane_flash[lane_key]
+            line = self._lane_line_shapes[lane_key]
+            line.thickness = width
+            line.color = (*col, alpha)
+            bg = self._lane_outer_bg_shapes[lane_key]
+            bg.radius = 14 + flash*6
+            bg.opacity = 90 + int(flash*100)
             sz = 16 + flash*10
-            col = info['color']
-            cc = pyglet.shapes.Circle(ex, ey, sz, color=col)
-            cc.opacity = 200 + int(flash*55)
-            cc.draw()
+            dot = self._center_lane_dots[lane_key]
+            dot.radius = sz
+            dot.opacity = 200 + int(flash*55)
+            glow = self._center_lane_glows[lane_key]
             if flash > 0.1:
-                glow = pyglet.shapes.Circle(ex, ey, sz+12, color=col)
+                glow.radius = sz+12
                 glow.opacity = int(flash*70)
-                glow.draw()
+                glow.visible = True
+            else:
+                if glow.visible:
+                    glow.visible = False
+                    glow.opacity = 0
 
     def _draw_beats(self, song_t):
         cx, cy = CENTER
+        # Visible toggle is faster than opacity 0 (batch skips invisible)
+        # Hide unused from previous frame only
+        prev_count = getattr(self, '_beat_last_count', 0)
+        pool_idx = 0
         for b in self.active_beats:
+            if pool_idx >= len(self._beat_pool):
+                break
+            slot = self._beat_pool[pool_idx]
+            circ = slot['circle']
+            inner_c = slot['inner']
+            tail = slot['tail']
+            hit_circ = slot['hit']
             if b['hit']:
                 delta = song_t - b['time'] if self.is_playing else 0
                 if delta < 0: delta = 0
                 prog = delta / 0.25
-                if prog > 1: continue
+                if prog > 1:
+                    circ.visible = False
+                    inner_c.visible = False
+                    tail.visible = False
+                    hit_circ.visible = False
+                    pool_idx += 1
+                    continue
                 ang = math.radians(b['angle'])
                 x = cx + math.cos(ang) * (TARGET_RADIUS + prog*30)
                 y = cy + math.sin(ang) * (TARGET_RADIUS + prog*30)
                 alpha = int(255 * (1 - prog))
                 sz = 28 * (1 - prog*0.6)
                 col = LANES[b['lane']]['color']
-                c = pyglet.shapes.Circle(x, y, sz, color=col)
-                c.opacity = max(0, alpha)
-                c.draw()
+                hit_circ.x = x; hit_circ.y = y; hit_circ.radius = sz; hit_circ.color = col
+                hit_circ.opacity = max(0, alpha)
+                hit_circ.visible = True
+                circ.visible = False
+                inner_c.visible = False
+                tail.visible = False
+                pool_idx += 1
                 continue
             raw = (song_t - (b['time'] - TRAVEL_TIME)) / TRAVEL_TIME if self.is_playing else 0.0
             if not self.is_playing:
+                circ.visible = False; inner_c.visible = False; tail.visible = False; hit_circ.visible = False
+                pool_idx += 1
                 continue
             if raw < 0: raw = 0
-            if raw > 1.2: continue
+            if raw > 1.2:
+                circ.visible = False; inner_c.visible = False; tail.visible = False; hit_circ.visible = False
+                pool_idx += 1
+                continue
             radius = SPAWN_RADIUS - raw * (SPAWN_RADIUS - TARGET_RADIUS)
             if radius < TARGET_RADIUS:
                 radius = TARGET_RADIUS
@@ -898,31 +1095,52 @@ class RhythmGame(pyglet.window.Window):
             col = LANES[b['lane']]['color']
             scale = 0.9 + 0.35 * raw
             sz = 22 * scale
-            tail = pyglet.shapes.Line(x, y, tx, ty, thickness=8, color=(*col, 90))
-            tail.draw()
-            circle = pyglet.shapes.Circle(x, y, sz, color=col)
-            circle.draw()
-            inner_c = pyglet.shapes.Circle(x, y, sz*0.55, color=(255,255,255))
-            inner_c.opacity = 200
-            inner_c.draw()
+            # tail hidden for 60fps (saves 1 shape per beat)
+            tail.visible = False
+            circ.x = x; circ.y = y; circ.radius = sz; circ.color = col
+            circ.opacity = 255
+            circ.visible = True
+            inner_c.visible = False
+            hit_circ.visible = False
+            pool_idx += 1
+        # hide leftover slots that were visible last frame
+        for idx in range(pool_idx, prev_count):
+            slot = self._beat_pool[idx]
+            slot['circle'].visible = False
+            slot['inner'].visible = False
+            slot['tail'].visible = False
+            slot['hit'].visible = False
+        self._beat_last_count = pool_idx
 
     def _draw_hud(self, song_t):
-        bar_h = 46
-        bar = pyglet.shapes.Rectangle(0, WINDOW_H - bar_h, WINDOW_W, bar_h, color=(18,18,30))
-        bar.opacity = 220
-        bar.draw()
-        self._draw_label(f"Score {self.score:06d}   Combo x{self.combo} (max {self.max_combo})", x=16, y=WINDOW_H-16, size=14, color=(240,240,255,255), anchor_x='left', anchor_y='top', weight='bold')
-        self._draw_label(f"P:{self.hits['perfect']}  G:{self.hits['good']}  OK:{self.hits['ok']}  M:{self.hits['miss']}", x=16, y=WINDOW_H-33, size=11, color=(180,180,200,255), anchor_x='left', anchor_y='top', font_name='Consolas')
+        # reuse persistent HUD shapes/labels - zero alloc, only update if changed
+        self._hud_top_bar.draw()
+        # score - only update text if changed to avoid layout rebuild
+        new_score = f"Score {self.score:06d}   Combo x{self.combo} (max {self.max_combo})"
+        if self._hud_score_lbl.text != new_score:
+            self._hud_score_lbl.text = new_score
+        self._hud_score_lbl.draw()
+        new_hits = f"P:{self.hits['perfect']}  G:{self.hits['good']}  OK:{self.hits['ok']}  M:{self.hits['miss']}"
+        if self._hud_hits_lbl.text != new_hits:
+            self._hud_hits_lbl.text = new_hits
+        self._hud_hits_lbl.draw()
         if self.is_playing:
             prog = song_t / self.duration if self.duration else 0
             prog = max(0, min(1, prog))
-            pw = WINDOW_W * prog
-            pyglet.shapes.Rectangle(0, 6, WINDOW_W, 4, color=(40,40,50)).draw()
-            pyglet.shapes.Rectangle(0, 6, pw, 4, color=(100,255,160)).draw()
-            self._draw_label(f"{int(song_t//60):01d}:{int(song_t%60):02d} / {int(self.duration//60):01d}:{int(self.duration%60):02d}", x=WINDOW_W-12, y=WINDOW_H-18, size=10, color=(180,220,255,255), anchor_x='right', anchor_y='top', font_name='Consolas')
+            pw = int(WINDOW_W * prog)
+            self._hud_prog_bg.draw()
+            if self._hud_prog_fg.width != pw:
+                self._hud_prog_fg.width = pw
+            self._hud_prog_fg.draw()
+            new_time = f"{int(song_t//60):01d}:{int(song_t%60):02d} / {int(self.duration//60):01d}:{int(self.duration%60):02d}"
+            if self._hud_time_lbl.text != new_time:
+                self._hud_time_lbl.text = new_time
+            self._hud_time_lbl.draw()
         else:
             mode = f"Media: {Path(self.media_path).name}" if self.media_path else "DEMO MODE"
-            self._draw_label(mode, x=WINDOW_W-12, y=WINDOW_H-32, size=10, color=(150,170,200,255), anchor_x='right', anchor_y='top', font_name='Consolas')
+            if self._hud_mode_lbl.text != mode:
+                self._hud_mode_lbl.text = mode
+            self._hud_mode_lbl.draw()
         if self.feedback_text and (time.time() - self.feedback_time) < 1.6:
             age = time.time() - self.feedback_time
             alpha = int(255 * (1 - age/1.6))
@@ -930,7 +1148,12 @@ class RhythmGame(pyglet.window.Window):
             scale = 1.0 + max(0, 0.25 - age*0.5)
             cx, cy = CENTER
             fsize = 28 if "PERFECT" in self.feedback_text else 24
-            self._draw_label(self.feedback_text, x=cx, y=cy+110 + int((scale-1)*20), size=fsize, color=(*self.feedback_color[:3], alpha), anchor_x='center', anchor_y='center', weight='bold')
+            self._hud_feedback_lbl.text = self.feedback_text
+            self._hud_feedback_lbl.font_size = fsize
+            self._hud_feedback_lbl.x = cx
+            self._hud_feedback_lbl.y = cy+110 + int((scale-1)*20)
+            self._hud_feedback_lbl.color = (*self.feedback_color[:3], alpha)
+            self._hud_feedback_lbl.draw()
 
     # --------------------------------------------------------
     # Main draw dispatcher
@@ -939,15 +1162,23 @@ class RhythmGame(pyglet.window.Window):
         self.clear()
         cx, cy = CENTER
         if self.state in ("playing", "paused", "results"):
-            # game bg
+            # game bg - update batched shapes
             pulse = self.hit_pulse
             self._draw_center_target(cx, cy, pulse)
             if self.state == "playing":
                 song_t = self.get_song_time()
                 self._draw_beats(song_t)
             elif self.state == "paused":
-                # still show beats frozen at pause time? skip
+                # still show beats frozen at pause time? skip (keep last positions)
                 pass
+            # draw all batched game shapes in one call (60fps)
+            try:
+                self.game_batch.draw()
+            except:
+                pass
+            # lane outer labels (persistent, on top of batch)
+            for lbl in self._lane_text_labels.values():
+                lbl.draw()
             # overlay for paused / results
             if self.state == "paused":
                 # dim
@@ -995,47 +1226,52 @@ class RhythmGame(pyglet.window.Window):
             return
 
         if self.state == "menu":
-            # title
-            self._draw_label("RADIAL RHYTHM", x=WINDOW_W//2, y=WINDOW_H - 120, size=40, color=(255,255,255,255), anchor_x='center', anchor_y='center', weight='bold')
-            self._draw_label("beats converge to the centre  •  D  F  J  K", x=WINDOW_W//2, y=WINDOW_H - 155, size=11, color=(140,200,255,255), anchor_x='center', anchor_y='center', font_name='Consolas')
-            # show songs folder hint
-            self._draw_label(f"songs in  ./songs/  ({len(get_songs_in_folder())} found)  •  add mp4 / mp3 / wav and press SONGS", x=WINDOW_W//2, y=WINDOW_H - 180, size=9, color=(130,140,160,255), anchor_x='center', anchor_y='center', font_name='Consolas')
+            # title - persistent
+            self._menu_title_lbl.draw()
+            self._menu_sub_lbl.draw()
+            self._menu_songs_hint_lbl.text = f"songs in  ./songs/  ({len(self.song_files)} found)  •  add mp4 / mp3 / wav and press SONGS"
+            self._menu_songs_hint_lbl.draw()
 
-            # menu options as boxes
+            # menu options as boxes - reuse persistent shapes (no alloc)
             for idx, opt in enumerate(self.menu_options):
                 y = 360 - idx*60
-                x = WINDOW_W//2
                 selected = idx == self.menu_index
-                w, h = 420, 44
-                # background
-                bg_col = (55, 55, 90) if selected else (28, 28, 42)
-                rect = pyglet.shapes.Rectangle(x - w//2, y - h//2, w, h, color=bg_col)
-                rect.draw()
-                # border highlight for selected
+                bg = self._menu_bg_rects[idx]
+                bg.color = (55, 55, 90) if selected else (28, 28, 42)
+                border = self._menu_border_rects[idx]
+                accent = self._menu_accent_rects[idx]
+                # draw order: border behind, bg, accent
                 if selected:
-                    # draw border lines (simple 1px border via enlarged rect)
-                    border = pyglet.shapes.Rectangle(x - w//2 -1, y - h//2 -1, w+2, h+2, color=(120,180,255))
-                    # need to draw border behind: we already drew bg, so draw again bg inset
+                    border.visible = True
+                    accent.visible = True
                     border.draw()
-                    rect.draw()
-                    # left color accent
-                    accent = pyglet.shapes.Rectangle(x - w//2, y - h//2, 6, h, color=(100,255,160))
+                    bg.draw()
                     accent.draw()
-                # lane colors hint for PLAY DEMO
+                else:
+                    border.visible = False
+                    accent.visible = False
+                    bg.draw()
+                # label
+                lbl = self._menu_option_lbls[idx]
+                lbl.y = y
                 txt_col = (255,255,120,255) if selected else (220,220,240,255)
-                weight = 'bold' if selected else 'normal'
-                self._draw_label(opt, x=x, y=y, size=16, color=(*txt_col[:3],255), anchor_x='center', anchor_y='center', weight=weight)
+                lbl.color = (*txt_col, 255)
+                lbl.weight = 'bold' if selected else 'normal'
+                lbl.text = opt
+                lbl.draw()
 
-            # footer
-            self._draw_label("UP/DOWN or W/S • ENTER/SPACE to select • O open external file • ESC quit", x=WINDOW_W//2, y=70, size=9, color=(110,120,150,255), anchor_x='center', anchor_y='center', font_name='Consolas')
-            # lane legend
-            y0 = 30
+            # footer - persistent
+            self._menu_footer_lbl.draw()
+            # lane legend - reuse persistent circles/labels
             for i, lane in enumerate(LANE_ORDER):
-                col = LANES[lane]['color']
-                xs = WINDOW_W//2 - 160 + i*90
-                c = pyglet.shapes.Circle(xs+16, y0, 10, color=col)
+                c = self._menu_lane_circles[i]
                 c.draw()
-                self._draw_label(f"{lane.upper()}", x=xs+34, y=y0, size=9, color=(200,200,220,255), anchor_x='left', anchor_y='center', font_name='Consolas')
+                lbl = self._menu_lane_lbls[i]
+                xs = WINDOW_W//2 - 160 + i*90
+                lbl.x = xs+34
+                lbl.y = 30
+                lbl.text = lane.upper()
+                lbl.draw()
             return
 
         if self.state == "song_select":
