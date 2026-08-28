@@ -427,32 +427,40 @@ def detect_beats_sfx(sr, audio, sensitivity=1.0, progress_cb=None):
     prog(1.0)
     return [float(t) for t in beats], float(bpm)
 
-def detect_beats_madmom(sr, audio, progress_cb=None):
-    """madmom RNN + DBN beat tracking (state of the art, slow).
-    Returns (beat_times, tempo)."""
+def detect_beats_madmom(sr, audio, sensitivity=1.0, progress_cb=None):
+    """madmom RNN onset detection (state-of-the-art, content-synced to actual
+    musical events: kicks, snares, notes). Returns (beat_times, tempo)."""
     import numpy as _np
-    from madmom.features.beats import RNNBeatProcessor, DBNBeatTrackingProcessor
+    from madmom.features.onsets import RNNOnsetProcessor, OnsetPeakPickingProcessor
     def prog(v):
         if progress_cb:
             try: progress_cb(v)
             except: pass
+    # sensitivity: higher -> catch more (lower threshold)
+    threshold = float(0.75 - 0.30 * max(0.0, min(2.0, sensitivity)))
     prog(0.1)
-    acts = RNNBeatProcessor()(audio.astype(_np.float32, copy=False), sample_rate=sr)
+    acts = RNNOnsetProcessor()(audio.astype(_np.float32, copy=False), sample_rate=sr)
     prog(0.8)
-    dec = DBNBeatTrackingProcessor(fps=100)
-    beats = dec(acts)
-    # estimate tempo from beat intervals
+    peak = OnsetPeakPickingProcessor(threshold=threshold, combine=0.05, fps=100)
+    beats = [float(t) for t in peak(acts)]
+    # enforce a minimum gap so notes are physically tappable
+    min_gap = 0.14
+    kept = []
+    for t in beats:
+        if not kept or t - kept[-1] >= min_gap:
+            kept.append(t)
+    beats = kept
+    # estimate musical tempo via spectral-flux autocorrelation (not note density)
     bpm = 120.0
-    if len(beats) > 4:
-        gaps = _np.diff(beats)
-        gaps = gaps[gaps > 0.1]
-        if len(gaps) > 2:
-            med = float(_np.median(gaps))
-            if med > 0:
-                bpm = 60.0 / med
-                # if detecting half-time, double if > 30 bpm below typical
+    try:
+        _flux = onset_envelope_sfx(sr, audio, hop=512)
+        bpm, _ = estimate_tempo_autocorr(sr, _flux, hop=512)
+        if not (30 < bpm < 240):
+            bpm = 120.0
+    except Exception:
+        bpm = 120.0
     prog(1.0)
-    return [float(t) for t in beats], float(bpm)
+    return beats, float(bpm)
 
 def beatmap_from_times(times, duration):
     """Build lane-assigned beatmap from a sorted list of beat times."""
@@ -537,7 +545,7 @@ def beats_from_media(media_path, sensitivity=1.0, use_librosa=True, progress_cb=
         try:
             import madmom
             prog(0.4)
-            madmom_times, _bpm = detect_beats_madmom(sr_read, audio,
+            madmom_times, _bpm = detect_beats_madmom(sr_read, audio, sensitivity=sensitivity,
                 progress_cb=lambda p: prog(0.4 + 0.32*p))
             if len(madmom_times) < 8:
                 madmom_times = None
@@ -546,7 +554,7 @@ def beats_from_media(media_path, sensitivity=1.0, use_librosa=True, progress_cb=
             madmom_times = None
         if madmom_times is not None:
             times = madmom_times
-            detected_bpm = 60.0 / (float(np.median(np.diff(np.array(times)))) if len(times) > 4 else 0.5)
+            detected_bpm = _bpm
         else:
             prog(0.42)
             times, detected_bpm = detect_beats_sfx(sr_read, audio, sensitivity=sensitivity, progress_cb=lambda p: prog(0.42 + 0.4*p))
