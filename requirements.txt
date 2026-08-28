@@ -1,0 +1,5 @@
+pyglet>=2.0
+numpy
+# optional for better beat detection - install if you want more accurate sync:
+# librosa
+# moviepy
