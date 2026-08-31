@@ -14,7 +14,7 @@ not a metronome, so the notes follow what you sing/what you hear.
 Hit the key when the beat reaches the centre ring.
 
 ## Features
-- **Main Menu** → `PLAY` / `OPEN FILE` / `QUIT` (osu!-style big-play-button layout).
+- **Main Menu** → `PLAY` / `OPEN FILE` / `SETTINGS` / `QUIT` (osu!-style big-play-button layout).
 - **osu!-style song select**: vertical carousel with the selected card "pulled out",
   a **live video preview** (full-bleed background, ≥30 fps) and a **song-colour accent**
   (the selected card + difficulty tab are tinted with the song's average colour, extracted
@@ -59,7 +59,13 @@ python main.py "C:\path\to\song.mp4"
 
 ## Controls
 ### Menu
+- Menu: `PLAY` / `OPEN FILE` / `SETTINGS` / `QUIT`.
 - `UP/DOWN` or `W/S` navigate, `ENTER/SPACE` select, `ESC` quit, `O` open external file.
+
+### Settings
+- `UP/DOWN` navigate settings, `ENTER` or `LEFT/RIGHT` toggle a setting, `B`/`ESC` back.
+- **Fullscreen** (ON/OFF) — persisted to `config.json` next to `main.py`, so it's remembered on
+  next launch. `F11` toggles fullscreen at any time (and persists it too).
 
 ### Song select (osu!-style)
 - `UP/DOWN` or `W/S` browse songs (clicking a card also selects it).

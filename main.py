@@ -1012,12 +1012,24 @@ class RhythmGame(pyglet.window.Window):
         self._fps_display = pyglet.window.FPSDisplay(self)
         self._fps_display.label.color = (120,120,130,180)
         self.is_fullscreen = False
+        # ---- persisted settings ----
+        self.settings = {"fullscreen": False}
+        self._config_path = Path(__file__).resolve().parent / "config.json"
+        self._load_config()
+        if self.settings.get("fullscreen"):
+            try:
+                self.set_fullscreen(True)
+                self.is_fullscreen = True
+            except Exception:
+                self.is_fullscreen = False
 
         # game state
         self.state = "menu"  # menu / song_select / playing / paused / results
         self.menu_index = 0
-        self.menu_options = ["PLAY", "OPEN FILE", "QUIT"]
+        self.menu_options = ["PLAY", "OPEN FILE", "SETTINGS", "QUIT"]
         self.menu_pull = 0.0  # animated menu selection position
+        self.settings_index = 0
+        self.settings_rows = [("fullscreen", "Fullscreen")]  # (setting key, label)
         # song-select preview state
         self.sc_scroll = 0.0       # animated carousel offset (pixels)
         self.sc_selected_pull = 0.0  # animated pull-out amount 0..1
@@ -1225,6 +1237,34 @@ class RhythmGame(pyglet.window.Window):
         self.preview_path = None
         self.preview_sprite = None
         self.preview_accent = (100, 255, 160)
+
+    def _load_config(self):
+        try:
+            if self._config_path.exists():
+                import json as _js
+                data = _js.load(open(self._config_path, encoding='utf-8'))
+                if isinstance(data, dict):
+                    if "fullscreen" in data:
+                        self.settings["fullscreen"] = bool(data.get("fullscreen"))
+        except Exception:
+            pass
+
+    def _save_config(self):
+        try:
+            import json as _js
+            with open(self._config_path, 'w', encoding='utf-8') as f:
+                _js.dump(self.settings, f, indent=2)
+        except Exception:
+            pass
+
+    def _apply_fullscreen(self, on):
+        self.is_fullscreen = bool(on)
+        self.settings["fullscreen"] = self.is_fullscreen
+        try:
+            self.set_fullscreen(self.is_fullscreen)
+        except Exception:
+            pass
+        self._save_config()
 
     def _load_song_colors(self):
         try:
@@ -1888,19 +1928,11 @@ class RhythmGame(pyglet.window.Window):
     def on_key_press(self, symbol, modifiers):
         # Global F11 for fullscreen
         if symbol == key.F11:
-            self.is_fullscreen = not self.is_fullscreen
-            try:
-                self.set_fullscreen(self.is_fullscreen)
-            except:
-                pass
+            self._apply_fullscreen(not self.is_fullscreen)
             return
         # ESC exits fullscreen first
         if symbol == key.ESCAPE and self.is_fullscreen:
-            self.is_fullscreen = False
-            try:
-                self.set_fullscreen(False)
-            except:
-                pass
+            self._apply_fullscreen(False)
             return
         # Global F1 for FPS toggle
         if symbol == key.F1:
@@ -1931,11 +1963,31 @@ class RhythmGame(pyglet.window.Window):
                     self.sc_scroll = 0.0
                 elif sel == "OPEN FILE":
                     self.open_media_dialog()
+                elif sel == "SETTINGS":
+                    self.settings_index = 0
+                    self.state = "settings"
                 elif sel == "QUIT":
                     pyglet.app.exit()
                 return
             if symbol == key.ESCAPE:
                 pyglet.app.exit()
+                return
+
+        elif self.state == "settings":
+            nrows = len(self.settings_rows)
+            if symbol in (key.UP, key.W):
+                self.settings_index = (self.settings_index - 1) % nrows
+                return
+            if symbol in (key.DOWN, key.S):
+                self.settings_index = (self.settings_index + 1) % nrows
+                return
+            if symbol in (key.LEFT, key.A, key.RIGHT, key.D, key.ENTER, key.SPACE, key.NUM_ENTER):
+                keyname = self.settings_rows[self.settings_index][0]
+                if keyname == "fullscreen":
+                    self._apply_fullscreen(not self.is_fullscreen)
+                return
+            if symbol in (key.ESCAPE, key.B):
+                self.state = "menu"
                 return
 
         elif self.state == "song_select":
@@ -2165,8 +2217,9 @@ class RhythmGame(pyglet.window.Window):
             cyw = self.height // 2
             centers = [
                 (self.width // 2, cyw, 170, 40),        # PLAY
-                (self.width // 2, cyw - 130, 130, 22),  # OPEN FILE
-                (self.width // 2, cyw - 176, 130, 22),  # QUIT
+                (self.width // 2, cyw - 130, 150, 22),  # OPEN FILE
+                (self.width // 2, cyw - 176, 150, 22),  # SETTINGS
+                (self.width // 2, cyw - 222, 150, 22),  # QUIT
             ]
             for idx, (cx, cy, hx, hy) in enumerate(centers):
                 if abs(x - cx) < hx and abs(y - cy) < hy:
@@ -2675,8 +2728,8 @@ class RhythmGame(pyglet.window.Window):
             play_lbl.color = (255, 255, 255, 255) if play_sel else (200, 215, 245, 255)
             play_lbl.draw()
 
-            # secondary buttons: OPEN FILE / QUIT
-            for idx in (1, 2):
+            # secondary buttons: OPEN FILE / SETTINGS / QUIT
+            for idx in (1, 2, 3):
                 opt = self.menu_options[idx]
                 wy = cyw - 130 - (idx - 1) * 46
                 selected = idx == self.menu_index
@@ -2710,6 +2763,56 @@ class RhythmGame(pyglet.window.Window):
                 lbl.y = 30
                 lbl.text = lane.upper()
                 lbl.draw()
+            return
+
+        if self.state == "settings":
+            # ---- settings screen (osu!-style) ----
+            scx, scy = self.width // 2, self.height // 2
+            bg = pyglet.shapes.Rectangle(0, 0, self.width, self.height, color=(8, 8, 16))
+            bg.draw()
+            # faint accent ring motif
+            t = time.time()
+            for i, lane in enumerate(LANE_ORDER):
+                col = LANES[lane]['color']
+                cc = pyglet.shapes.Circle(scx, scy + 60, 170 - i * 22, color=col)
+                cc.opacity = int(14 + 10 * (0.5 + 0.5 * math.sin(t * 1.4 + i)))
+                cc.draw()
+            self._draw_label("SETTINGS", x=scx, y=scy + 190, size=34, color=(255, 255, 255, 255), anchor_x='center', anchor_y='center', weight='bold')
+
+            # settings card
+            card_w, card_h = 560, 120
+            card = pyglet.shapes.Rectangle(scx - card_w // 2, scy - card_h // 2 - 20, card_w, card_h, color=(20, 24, 38))
+            card.draw()
+            border = pyglet.shapes.Rectangle(scx - card_w // 2, scy - card_h // 2 - 20, card_w, 3, color=(120, 180, 255))
+            border.draw()
+
+            # rows
+            nrows = len(self.settings_rows)
+            row_h = 56
+            start_y = scy + 20
+            for i, (keyname, label) in enumerate(self.settings_rows):
+                ry = start_y - i * (row_h + 8)
+                selected = i == self.settings_index
+                # value for this setting
+                if keyname == "fullscreen":
+                    val = "ON" if self.is_fullscreen else "OFF"
+                else:
+                    val = str(self.settings.get(keyname, ""))
+                row_bg = pyglet.shapes.Rectangle(scx - card_w // 2 + 24, ry - row_h // 2, card_w - 48, row_h,
+                                                 color=(44, 58, 92) if selected else (26, 30, 46))
+                row_bg.draw()
+                if selected:
+                    acc = pyglet.shapes.Rectangle(scx - card_w // 2 + 24, ry - row_h // 2, 6, row_h, color=(100, 255, 160))
+                    acc.draw()
+                self._draw_label(label, x=scx - card_w // 2 + 60, y=ry, size=20,
+                                 color=(255, 255, 255, 255) if selected else (200, 210, 235, 255),
+                                 anchor_x='left', anchor_y='center', weight='bold' if selected else 'normal')
+                self._draw_label(val, x=scx + card_w // 2 - 60, y=ry, size=22,
+                                 color=(140, 230, 160, 255) if val == "ON" else (190, 120, 120, 255),
+                                 anchor_x='right', anchor_y='center', weight='bold')
+
+            self._draw_label("UP/DOWN : navigate        ENTER or LEFT/RIGHT : toggle        B / ESC : back", x=scx, y=scy - card_h // 2 - 55, size=10, color=(140, 150, 180, 255), anchor_x='center', anchor_y='center', font_name='Consolas')
+            self._draw_label("(F11 also toggles fullscreen anytime)", x=scx, y=scy - card_h // 2 - 76, size=9, color=(100, 110, 140, 255), anchor_x='center', anchor_y='center', font_name='Consolas')
             return
 
         if self.state == "song_select":
