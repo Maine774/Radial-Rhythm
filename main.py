@@ -1027,7 +1027,11 @@ class RhythmGame(pyglet.window.Window):
         self.preview_sprite = None
         self._preview_seek = 2.0
         self._preview_seek_done = True
+        self.preview_accent = (100, 255, 160)   # avg color of selected song preview (for selection tab)
+        self.song_accents = {}   # path -> (r,g,b) song accent colour (computed via ffmpeg)
+        self._accent_path = None
         self.song_durations = {}   # path -> duration seconds (cached)
+        self._load_song_colors()
 
         self.song_files = get_songs_in_folder()
         self.song_index = 0
@@ -1220,6 +1224,107 @@ class RhythmGame(pyglet.window.Window):
         self.preview_source = None
         self.preview_path = None
         self.preview_sprite = None
+        self.preview_accent = (100, 255, 160)
+
+    def _load_song_colors(self):
+        try:
+            cf = get_cache_path("__song_colors__", "all")
+            if cf.exists():
+                import json as _js
+                data = _js.load(open(cf, encoding='utf-8'))
+                if isinstance(data, dict):
+                    for k, v in data.items():
+                        if isinstance(v, (list, tuple)) and len(v) == 3:
+                            self.song_accents[k] = tuple(int(c) for c in v)
+        except Exception:
+            pass
+
+    def _save_song_colors(self):
+        try:
+            cf = get_cache_path("__song_colors__", "all")
+            cf.parent.mkdir(parents=True, exist_ok=True)
+            import json as _js
+            with open(cf, 'w', encoding='utf-8') as f:
+                _js.dump(self.song_accents, f)
+        except Exception:
+            pass
+
+    def _enhance_accent(self, r, g, b):
+        # brighten dark content + boost saturation so the accent reads as a vivid "song colour"
+        lum = 0.299 * r + 0.587 * g + 0.114 * b
+        if lum < 150:
+            boost = min(2.2, 170.0 / max(1.0, lum))
+            r = min(255, int(r * boost)); g = min(255, int(g * boost)); b = min(255, int(b * boost))
+        max_c = max(r, g, b)
+        min_c = min(r, g, b)
+        if max_c > 0 and (max_c - min_c) < 40:
+            avg = (r + g + b) / 3.0
+            sat = 1.5
+            r = int(max(0, min(255, avg + (r - avg) * sat)))
+            g = int(max(0, min(255, avg + (g - avg) * sat)))
+            b = int(max(0, min(255, avg + (b - avg) * sat)))
+        if max(r, g, b) < 60:
+            r = max(r, 90); g = max(g, 90); b = max(b, 90)
+        return (r, g, b)
+
+    def _compute_song_accent(self, path):
+        # ffmpeg -> one downscaled frame -> average colour (deterministic, works headless)
+        try:
+            cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                   "-ss", "8", "-i", str(path), "-frames:v", "1",
+                   "-vf", "scale=48:27", "-pix_fmt", "rgb24", "-f", "rawvideo", "-"]
+            res = subprocess.run(cmd, capture_output=True)
+            raw = res.stdout
+            if not raw or len(raw) < 48 * 27 * 3:
+                return None
+            total = 48 * 27
+            r = sum(raw[i] for i in range(0, len(raw), 3))
+            # only sample as many complete pixels as decoded
+            n = len(raw) // 3
+            if n == 0:
+                return None
+            r = g = b = 0
+            for i in range(0, n * 3, 3):
+                r += raw[i]
+            g = sum(raw[i] for i in range(1, n * 3, 3))
+            b = sum(raw[i] for i in range(2, n * 3, 3))
+            r, g, b = r // n, g // n, b // n
+            if r == 0 and g == 0 and b == 0:
+                return None
+            return self._enhance_accent(r, g, b)
+        except Exception:
+            return None
+
+    def _ensure_accent(self, path):
+        # return a cached accent or kick off a background ffmpeg computation
+        if not path:
+            return
+        ext = str(path).lower().rsplit('.', 1)[-1] if '.' in str(path) else ''
+        if ext in ("mp3", "wav", "ogg", "flac", "m4a"):
+            return  # no video frames to derive a colour from
+        if path in self.song_accents:
+            self.preview_accent = self.song_accents[path]
+            return
+        if self._accent_path == path:
+            return  # already computing this song
+        self._accent_path = path
+
+        def worker():
+            try:
+                col = self._compute_song_accent(path)
+            except Exception:
+                col = None
+            if col:
+                self.song_accents[path] = col
+                self._save_song_colors()
+                if self.preview_path == path:
+                    self.preview_accent = col
+            if getattr(self, '_accent_path', None) == path:
+                self._accent_path = None
+
+        import threading
+        threading.Thread(target=worker, daemon=True).start()
+
 
     def _set_preview(self, path):
         # (re)load preview player for the currently selected song (seek to ~30%).
@@ -1274,6 +1379,12 @@ class RhythmGame(pyglet.window.Window):
                 if dur and pt >= dur - 0.4:
                     self.preview_player.seek(self._preview_seek)
             except: pass
+            # advance/pull the video so preview stays at app frame rate (>=30fps)
+            try:
+                if hasattr(self.preview_player, 'get_texture'):
+                    self.preview_player.get_texture()
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -1306,6 +1417,7 @@ class RhythmGame(pyglet.window.Window):
                 self.preview_sprite.opacity = 255
                 # clip to preview panel via a covering draw then overlay
                 self.preview_sprite.draw()
+                self._ensure_accent(self.preview_path)
                 return True
             except Exception:
                 pass
@@ -1644,7 +1756,7 @@ class RhythmGame(pyglet.window.Window):
             if self.state == "song_select":
                 # animate pull-out and carousel offset toward targets
                 self.sc_selected_pull += (1.0 - self.sc_selected_pull) * min(1.0, dt * 12)
-                target_scroll = -(self.song_index * 112.0)
+                target_scroll = +(self.song_index * 112.0)
                 self.sc_scroll += (target_scroll - self.sc_scroll) * min(1.0, dt * 10)
                 # load preview for selected song (throttled for quick up/down)
                 if self.song_files:
@@ -2063,19 +2175,20 @@ class RhythmGame(pyglet.window.Window):
                     break
         elif self.state == "song_select":
             # carousel cards live on the right; clicking selects that song
-            if self.song_files and x > WINDOW_W - 400:
+            if self.song_files and x > WINDOW_W - 430:
                 base_y = self.height // 2
-                approx = (y - base_y - self.sc_scroll) / 112.0
+                approx = (base_y + self.sc_scroll - y) / 112.0
                 idx = int(round(approx))
                 if 0 <= idx < len(self.song_files):
                     self.song_index = idx
                     return
-            # difficulty buttons on the left (x 60..320)
-            if self.song_files and 60 <= x <= 320:
-                base_y = self.height // 2
+            # difficulty buttons on the left (x 90..410, y centres 500/424/348)
+            if self.song_files and 90 <= x <= 410:
+                so = []
                 for idx in range(len(self.difficulty_options)):
-                    by = base_y + 40 - idx * 62
-                    if by - 24 <= y <= by + 24:
+                    so.append((500 - idx * 76, idx))
+                for by, idx in so:
+                    if abs(y - by) <= 28:
                         self.difficulty_index = idx
                         self.difficulty = self.difficulty_options[idx].lower()
                         return
@@ -2634,11 +2747,13 @@ class RhythmGame(pyglet.window.Window):
                 self._draw_label("B / ESC : back", x=cx, y=40, size=10, color=(150, 160, 190, 255), anchor_x='center', anchor_y='center', font_name='Consolas')
                 return
 
-            # ---- left: selected song details + difficulty preview ----
+            # ---- left column: selected song details + difficulty selector ----
+            acc_r, acc_g, acc_b = self.preview_accent
+            diff_desc = {k: DIFFICULTY_PROFILES[k][6] for k in DIFFICULTY_ORDER}
             name = sel.name
-            disp = name if len(name) <= 34 else name[:31] + "..."
-            self._draw_label(disp, x=190, y=base_y + 150, size=26, color=(255, 255, 255, 255), anchor_x='center', anchor_y='center', weight='bold')
-            # subtitle: size / ext / duration-ish
+            disp = name if len(name) <= 30 else name[:27] + "..."
+            self._draw_label(disp, x=90, y=WINDOW_H - 108, size=30, color=(255, 255, 255, 255), anchor_x='left', anchor_y='center', weight='bold')
+            # subtitle: size / ext / cached count
             sub_parts = []
             try:
                 sz_mb = sel.stat().st_size / (1024*1024)
@@ -2651,80 +2766,97 @@ class RhythmGame(pyglet.window.Window):
             except: pass
             if meta:
                 cached = sum(1 for v in meta.values() if v)
-                sub_parts.append(f"{cached}/3 beatmaps cached")
-            self._draw_label("  •  ".join(sub_parts), x=190, y=base_y + 118, size=11, color=(150, 170, 205, 255), anchor_x='center', anchor_y='center', font_name='Consolas')
+                sub_parts.append(f"{cached}/3 beatmaps")
+            self._draw_label("  •  ".join(sub_parts), x=90, y=WINDOW_H - 142, size=11, color=(180, 195, 220, 255), anchor_x='left', anchor_y='center', font_name='Consolas')
 
-            # difficulty buttons (left preview of what ENTER leads to)
+            # difficulty buttons
+            btn_w, btn_h = 320, 56
+            bys = [500, 500 - 76, 500 - 152]
             for idx, opt in enumerate(self.difficulty_options):
-                by = base_y + 40 - idx * 62
+                by = bys[idx]
                 selected_d = idx == self.difficulty_index
-                bcol = (70, 96, 140) if selected_d else (30, 40, 66)
-                btn = pyglet.shapes.Rectangle(60, by - 24, 260, 48, color=bcol)
+                if selected_d:
+                    bcol = (acc_r, acc_g, acc_b) if (acc_r+acc_g+acc_b) < 420 else (acc_r//2, acc_g//2, acc_b//2)
+                    bcol = (min(255,acc_r), min(255,acc_g), min(255,acc_b))
+                else:
+                    bcol = (26, 32, 52)
+                btn = pyglet.shapes.Rectangle(90, by - btn_h//2, btn_w, btn_h, color=bcol)
                 btn.draw()
                 if selected_d:
-                    accc = pyglet.shapes.Rectangle(60, by - 24, 6, 48, color=(100, 255, 160))
-                    accc.draw()
-                lbl = self._draw_label(opt, x=80, y=by + 4, size=16, color=(255, 255, 200, 255) if selected_d else (215, 220, 240, 255), anchor_x='left', anchor_y='center', weight='bold')
-                # rating / beats for this difficulty if cached
+                    # accent left edge + chevron for the active difficulty
+                    acc_bar = pyglet.shapes.Rectangle(90, by - btn_h//2, 8, btn_h, color=(255, 255, 255))
+                    acc_bar.draw()
+                    tri = pyglet.shapes.Triangle(90 + btn_w + 2, by + 10, 90 + btn_w + 2, by - 10, 90 + btn_w + 16, by, color=bcol)
+                    tri.draw()
+                tcol = (255, 255, 255, 255) if selected_d else (205, 212, 232, 255)
+                self._draw_label(opt, x=118, y=by + 6, size=18, color=tcol, anchor_x='left', anchor_y='center', weight='bold')
+                # difficulty description + rating
                 m = meta.get(opt.lower())
-                if m:
+                if m and m[0]:
                     r, bts = m
-                    self._draw_label(f"d{r}  •  {bts} beats", x=300, y=by, size=10, color=(140, 210, 150, 255), anchor_x='right', anchor_y='center', font_name='Consolas')
+                    detail = f"d{r}  •  {bts} beats"
+                else:
+                    detail = diff_desc.get(opt.lower(), "")
+                self._draw_label(detail, x=118, y=by - 16, size=10, color=(235, 235, 255, 255) if selected_d else (150, 162, 190, 255), anchor_x='left', anchor_y='center', font_name='Consolas')
             # hint under difficulty buttons
-            self._draw_label("1/2/3 or LEFT/RIGHT: difficulty  •  ENTER: play this song", x=190, y=base_y - 95, size=10, color=(120, 140, 175, 255), anchor_x='center', anchor_y='center', font_name='Consolas')
+            self._draw_label("1 / 2 / 3  or  LEFT / RIGHT : difficulty      •      ENTER : play this song", x=90, y=306, size=10, color=(150, 165, 195, 255), anchor_x='left', anchor_y='center', font_name='Consolas')
 
             # ---- right: vertical carousel of song cards (selected pulled out) ----
             play_pull = self.sc_selected_pull  # 0..1
-            # determine visible window (approx 7 songs for 112px step within 720 height)
             vis_half = 4
             i0 = max(0, self.song_index - vis_half)
             i1 = min(len(self.song_files) - 1, self.song_index + vis_half)
-            cw, ch = 320, 96
+            cw, ch = 330, 92
             for i in range(i0, i1 + 1):
                 p = self.song_files[i]
                 rel = i - self.song_index
-                cy = base_y + self.sc_scroll + i * 112.0
+                # index 0 at top; higher index lower on screen
+                cy = base_y + self.sc_scroll - i * 112.0
                 selected = i == self.song_index
-                # pull the selected card toward the front (scale + brighter + gap)
                 if selected:
                     scale = 1.0 + 0.16 * play_pull
-                    xoff = -40 * play_pull
-                    col_bg = (66, 92, 140)
+                    xoff = -46 * play_pull
                     alpha = 255
                 else:
                     scale = 1.0
                     xoff = 0.0
                     dist = abs(rel)
-                    alpha = max(60, 160 - dist * 45)
-                    col_bg = (26, 32, 52)
+                    alpha = max(55, 168 - dist * 50)
                 w = cw * scale
                 h = ch * scale
-                x0 = WINDOW_W - w - 40 + xoff
+                x0 = WINDOW_W - w - 46 + xoff
                 y0 = cy - h / 2
-                # card panel
+                # card panel (selected tinted with the song's accent color)
+                if selected:
+                    col_bg = (max(28, acc_r//3), max(28, acc_g//3), max(28, acc_b//3))
+                else:
+                    col_bg = (24, 30, 50)
                 card = pyglet.shapes.Rectangle(x0, y0, w, h, color=col_bg)
                 card.opacity = alpha
                 card.draw()
                 if selected:
-                    bord = pyglet.shapes.Rectangle(x0 + w - 5, y0, 5, h, color=(100, 255, 160))
+                    # accent side bar (uses the song's color)
+                    bord = pyglet.shapes.Rectangle(x0, y0, 7, h, color=(acc_r, acc_g, acc_b))
                     bord.draw()
-                # name inside card
+                    ring = pyglet.shapes.Rectangle(x0, y0, w, 3, color=(acc_r, acc_g, acc_b))
+                    ring.draw()
+                    ring2 = pyglet.shapes.Rectangle(x0, y0 + h - 3, w, 3, color=(acc_r, acc_g, acc_b))
+                    ring2.draw()
                 nm = p.name
-                if len(nm) > 26:
-                    nm = nm[:23] + "..."
-                tcol = (255, 255, 255, 255) if selected else (200, 210, 235, 255)
-                self._draw_label(nm, x=x0 + 16, y=cy + 10, size=14, color=tcol, anchor_x='left', anchor_y='center', weight='bold' if selected else 'normal')
-                # subtitle: ext / size
+                if len(nm) > 27:
+                    nm = nm[:24] + "..."
+                tcol = (255, 255, 255, 255) if selected else (205, 214, 238, 255)
+                self._draw_label(nm, x=x0 + 18, y=cy + 12, size=14, color=tcol, anchor_x='left', anchor_y='center', weight='bold' if selected else 'normal')
                 try:
                     s2 = f"{p.stat().st_size/(1024*1024):.1f} MB"
                 except:
                     s2 = p.suffix.lstrip('.').upper()
-                self._draw_label(f"{p.suffix.lstrip('.').upper()}  •  {s2}", x=x0 + 16, y=cy - 20, size=9, color=(140, 155, 185, 255), anchor_x='left', anchor_y='center', font_name='Consolas')
+                self._draw_label(f"{p.suffix.lstrip('.').upper()}  •  {s2}", x=x0 + 18, y=cy - 20, size=9, color=(148, 162, 192, 255), anchor_x='left', anchor_y='center', font_name='Consolas')
             # scroll handle hint (index / total)
-            self._draw_label(f"{self.song_index+1} / {len(self.song_files)}", x=WINDOW_W - 40, y=WINDOW_H - 40, size=12, color=(200, 210, 240, 255), anchor_x='right', anchor_y='center', weight='bold', font_name='Consolas')
+            self._draw_label(f"{self.song_index+1} / {len(self.song_files)}", x=WINDOW_W - 46, y=WINDOW_H - 42, size=12, color=(215, 222, 240, 255), anchor_x='right', anchor_y='center', weight='bold', font_name='Consolas')
 
             # bottom bar
-            self._draw_label("UP/DOWN or W/S : browse   •   ENTER : choose difficulty   •   R refresh   •   B/ESC : back", x=cx, y=24, size=10, color=(150, 160, 190, 255), anchor_x='center', anchor_y='center', font_name='Consolas')
+            self._draw_label("UP / DOWN  browse      •      LEFT / RIGHT  difficulty      •      ENTER  play      •      R  refresh      •      B / ESC  back", x=cx, y=24, size=10, color=(150, 160, 190, 255), anchor_x='center', anchor_y='center', font_name='Consolas')
             # feedback
             if self.feedback_text and (time.time() - self.feedback_time) < 3.0:
                 age = time.time() - self.feedback_time
