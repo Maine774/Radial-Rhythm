@@ -1016,7 +1016,18 @@ class RhythmGame(pyglet.window.Window):
         # game state
         self.state = "menu"  # menu / song_select / playing / paused / results
         self.menu_index = 0
-        self.menu_options = ["PLAY DEMO", "SONGS", "QUIT"]
+        self.menu_options = ["PLAY", "OPEN FILE", "QUIT"]
+        self.menu_pull = 0.0  # animated menu selection position
+        # song-select preview state
+        self.sc_scroll = 0.0       # animated carousel offset (pixels)
+        self.sc_selected_pull = 0.0  # animated pull-out amount 0..1
+        self.preview_player = None
+        self.preview_source = None
+        self.preview_path = None
+        self.preview_sprite = None
+        self._preview_seek = 2.0
+        self._preview_seek_done = True
+        self.song_durations = {}   # path -> duration seconds (cached)
 
         self.song_files = get_songs_in_folder()
         self.song_index = 0
@@ -1170,7 +1181,7 @@ class RhythmGame(pyglet.window.Window):
         for opt in self.menu_options:
             lbl = pyglet.text.Label(opt, x=WINDOW_W//2, y=0, font_name='Arial', font_size=16, weight='bold', color=(220,220,240,255), anchor_x='center', anchor_y='center')
             self._menu_option_lbls.append(lbl)
-        self._menu_footer_lbl = pyglet.text.Label("UP/DOWN or W/S • ENTER/SPACE to select • O open external file • ESC quit", x=WINDOW_W//2, y=70, font_name='Consolas', font_size=9, color=(110,120,150,255), anchor_x='center', anchor_y='center')
+        self._menu_footer_lbl = pyglet.text.Label("UP/DOWN or W/S : navigate   •   ENTER/SPACE : select   •   O : open external file   •   ESC : quit", x=WINDOW_W//2, y=70, font_name='Consolas', font_size=9, color=(110,120,150,255), anchor_x='center', anchor_y='center')
         self._menu_lane_lbls = []
         for lane in LANE_ORDER:
             lbl = pyglet.text.Label(lane.upper(), x=0, y=30, font_name='Consolas', font_size=9, color=(200,200,220,255), anchor_x='left', anchor_y='center')
@@ -1196,6 +1207,123 @@ class RhythmGame(pyglet.window.Window):
         if self.song_index >= len(self.song_files):
             self.song_index = max(0, len(self.song_files)-1)
         self.songs_scroll = 0
+        self.song_durations = {}
+
+    def _stop_preview(self):
+        try:
+            if self.preview_player:
+                self.preview_player.pause()
+                try: self.preview_player.delete()
+                except: pass
+        except: pass
+        self.preview_player = None
+        self.preview_source = None
+        self.preview_path = None
+        self.preview_sprite = None
+
+    def _set_preview(self, path):
+        # (re)load preview player for the currently selected song (seek to ~30%).
+        # Falls back gracefully if the media can't be loaded / has no video.
+        if path == self.preview_path and self.preview_source is not None:
+            return
+        self._stop_preview()
+        if not path:
+            return
+        self.preview_path = path
+        try:
+            src = pyglet.media.load(str(path), streaming=True)
+            self.preview_source = src
+            self.preview_player = pyglet.media.Player()
+            self.preview_player.queue(src)
+            self.preview_player.volume = 0.35
+            try:
+                dur = float(src.duration) if src.duration else 30.0
+                self._preview_seek = min(max(dur * 0.3, 0.0), max(0.0, dur - 3.0))
+            except:
+                self._preview_seek = 2.0
+            self._preview_seek_done = False
+            try:
+                self.preview_player.play()
+            except: pass
+            print(f"[preview] loaded {Path(path).name}")
+        except Exception as e:
+            print(f"[preview] failed {e}")
+            self.preview_source = None
+            self.preview_player = None
+
+    def _tick_preview(self, dt):
+        # called each frame in song_select; seeks preview once then loops
+        if self.state != "song_select":
+            return
+        if self.preview_player is None or self.preview_source is None:
+            return
+        try:
+            if not self._preview_seek_done:
+                try:
+                    self.preview_player.seek(self._preview_seek)
+                    self._preview_seek_done = True
+                except:
+                    self._preview_seek_done = True
+            # loop preview by seeking back when it ends (approx via source duration)
+            try:
+                dur = float(self.preview_source.duration) if self.preview_source.duration else 0
+                pt = 0.0
+                try:
+                    pt = float(self.preview_player.time) if self.preview_player.time is not None else 0.0
+                except: pass
+                if dur and pt >= dur - 0.4:
+                    self.preview_player.seek(self._preview_seek)
+            except: pass
+        except Exception:
+            pass
+
+    def _draw_song_preview(self, x, y, w, h, song_path):
+        # draws the live video preview for the selected song (or a themed placeholder)
+        tex = None
+        if self.preview_player is not None and self.preview_path == song_path:
+            try:
+                if hasattr(self.preview_player, 'texture'):
+                    tex = self.preview_player.texture
+                elif hasattr(self.preview_player, 'get_texture'):
+                    tex = self.preview_player.get_texture()
+            except:
+                tex = None
+        if tex is not None and getattr(tex, 'width', 0) > 0:
+            try:
+                if self.preview_sprite is None:
+                    self.preview_sprite = pyglet.sprite.Sprite(tex, x=0, y=0)
+                else:
+                    try:
+                        if self.preview_sprite.image != tex:
+                            self.preview_sprite.image = tex
+                    except: pass
+                scale = max(w / tex.width, h / tex.height)
+                self.preview_sprite.scale = scale
+                nw = tex.width * scale
+                nh = tex.height * scale
+                self.preview_sprite.x = x + (w - nw) / 2
+                self.preview_sprite.y = y + (h - nh) / 2
+                self.preview_sprite.opacity = 255
+                # clip to preview panel via a covering draw then overlay
+                self.preview_sprite.draw()
+                return True
+            except Exception:
+                pass
+        return False
+
+    def _load_song_difficulty_meta(self, path):
+        # returns {diff: (rating, beats)} from cached beatmaps (fast, no analysis)
+        meta = {}
+        for d in DIFFICULTY_ORDER:
+            try:
+                cp = get_cache_path(path, d)
+                if cp.exists():
+                    import json as _js
+                    data = _js.load(open(cp, encoding='utf-8'))
+                    meta[d] = (data.get('rating', 1), len(data.get('beatmap', [])))
+            except Exception:
+                meta[d] = None
+        return meta
 
     def load_demo(self):
         self.beatmap = self.demo_beatmap
@@ -1361,6 +1489,7 @@ class RhythmGame(pyglet.window.Window):
         pass
 
     def load_media(self, path, difficulty=None, autoplay=False):
+        self._stop_preview()
         if difficulty is None:
             difficulty = self.difficulty
         difficulty = clamp_difficulty(difficulty)
@@ -1511,6 +1640,27 @@ class RhythmGame(pyglet.window.Window):
                 if not hasattr(self, '_last_refresh') or time.time() - self._last_refresh > 1.5:
                     self.song_files = get_songs_in_folder()
                     self._last_refresh = time.time()
+            # song-select: animated carousel + live preview for the selected song
+            if self.state == "song_select":
+                # animate pull-out and carousel offset toward targets
+                self.sc_selected_pull += (1.0 - self.sc_selected_pull) * min(1.0, dt * 12)
+                target_scroll = -(self.song_index * 112.0)
+                self.sc_scroll += (target_scroll - self.sc_scroll) * min(1.0, dt * 10)
+                # load preview for selected song (throttled for quick up/down)
+                if self.song_files:
+                    try:
+                        idx = max(0, min(len(self.song_files)-1, self.song_index))
+                        sel = self.song_files[idx]
+                        if sel != self.preview_path:
+                            if not hasattr(self, '_prev_load_t') or time.time() - self._prev_load_t > 0.22:
+                                self._prev_load_t = time.time()
+                                self._set_preview(str(sel))
+                        else:
+                            self._tick_preview(dt)
+                    except Exception:
+                        pass
+                else:
+                    self._stop_preview()
             return
         if not self.is_playing:
             return
@@ -1661,13 +1811,14 @@ class RhythmGame(pyglet.window.Window):
                 return
             if symbol in (key.ENTER, key.SPACE, key.NUM_ENTER):
                 sel = self.menu_options[self.menu_index]
-                if sel == "PLAY DEMO":
-                    self.start_demo()
-                elif sel == "SONGS":
+                if sel == "PLAY":
                     self.refresh_song_list()
                     self.state = "song_select"
                     self.song_index = 0
                     self.songs_scroll = 0
+                    self.sc_scroll = 0.0
+                elif sel == "OPEN FILE":
+                    self.open_media_dialog()
                 elif sel == "QUIT":
                     pyglet.app.exit()
                 return
@@ -1695,12 +1846,26 @@ class RhythmGame(pyglet.window.Window):
                     chosen = self.song_files[self.song_index]
                     self.pending_song_path = str(chosen)
                     self.difficulty_index = DIFFICULTY_ORDER.index(self.difficulty) if self.difficulty in DIFFICULTY_ORDER else 0
+                    self._stop_preview()
                     self.state = "difficulty_select"
                 else:
                     self.feedback_text = "No songs - add files to songs/ folder"
                     self.feedback_color = (255,180,80,255)
                     self.feedback_time = time.time()
                 return
+            if symbol in (key.LEFT, key.A):
+                self.difficulty_index = (self.difficulty_index - 1) % len(self.difficulty_options)
+                self.difficulty = self.difficulty_options[self.difficulty_index].lower()
+                return
+            if symbol in (key.RIGHT, key.D):
+                self.difficulty_index = (self.difficulty_index + 1) % len(self.difficulty_options)
+                self.difficulty = self.difficulty_options[self.difficulty_index].lower()
+                return
+            for _qk, _qd in ((key._1,"easy"),(key._2,"medium"),(key._3,"hard")):
+                if symbol == _qk:
+                    self.difficulty = _qd
+                    self.difficulty_index = DIFFICULTY_ORDER.index(_qd)
+                    return
             if symbol == key.R:
                 self.refresh_song_list()
                 self.feedback_text = f"Refreshed - {len(self.song_files)} songs"
@@ -1709,11 +1874,13 @@ class RhythmGame(pyglet.window.Window):
                 return
             if symbol in (key.ESCAPE, key.B):
                 self.state = "menu"
+                self._stop_preview()
                 return
             if symbol == key.P and self.song_files:
                 chosen = self.song_files[self.song_index]
                 self.pending_song_path = str(chosen)
                 self.difficulty_index = DIFFICULTY_ORDER.index(self.difficulty) if self.difficulty in DIFFICULTY_ORDER else 0
+                self._stop_preview()
                 self.state = "difficulty_select"
                 return
 
@@ -1882,28 +2049,36 @@ class RhythmGame(pyglet.window.Window):
     def on_mouse_press(self, x, y, button, modifiers):
         # simple click handling for menu / song select
         if self.state == "menu":
-            # menu items are centered at y ~ 360,300,240
-            # approximate hit zones
-            centers = [(WINDOW_W//2, 360), (WINDOW_W//2, 300), (WINDOW_W//2, 240)]
-            for idx, (cx, cy) in enumerate(centers):
-                if abs(x - cx) < 210 and abs(y - cy) < 26:
+            # osu-style: PLAY pill at center, OPEN/QUIT below
+            cyw = self.height // 2
+            centers = [
+                (self.width // 2, cyw, 170, 40),        # PLAY
+                (self.width // 2, cyw - 130, 130, 22),  # OPEN FILE
+                (self.width // 2, cyw - 176, 130, 22),  # QUIT
+            ]
+            for idx, (cx, cy, hx, hy) in enumerate(centers):
+                if abs(x - cx) < hx and abs(y - cy) < hy:
                     self.menu_index = idx
-                    # simulate enter
                     self.on_key_press(key.ENTER, 0)
                     break
         elif self.state == "song_select":
-            # song list area: x 220-1060, y from 520 down
-            if 220 <= x <= 1060 and 120 <= y <= 550:
-                # compute index from y
-                row_h = 36
-                top_y = 520
-                rel = top_y - y
-                idx = int(rel // row_h) + self.songs_scroll
+            # carousel cards live on the right; clicking selects that song
+            if self.song_files and x > WINDOW_W - 400:
+                base_y = self.height // 2
+                approx = (y - base_y - self.sc_scroll) / 112.0
+                idx = int(round(approx))
                 if 0 <= idx < len(self.song_files):
                     self.song_index = idx
-                    # double click would play; single click selects
-                    # if click near bottom play button? just select
-                    pass
+                    return
+            # difficulty buttons on the left (x 60..320)
+            if self.song_files and 60 <= x <= 320:
+                base_y = self.height // 2
+                for idx in range(len(self.difficulty_options)):
+                    by = base_y + 40 - idx * 62
+                    if by - 24 <= y <= by + 24:
+                        self.difficulty_index = idx
+                        self.difficulty = self.difficulty_options[idx].lower()
+                        return
 
     # --------------------------------------------------------
     # Drawing helpers
@@ -2339,135 +2514,224 @@ class RhythmGame(pyglet.window.Window):
             return
 
         if self.state == "menu":
-            # update for fullscreen (dynamic center)
-            self._menu_title_lbl.x = self.width // 2
-            self._menu_sub_lbl.x = self.width // 2
-            self._menu_songs_hint_lbl.x = self.width // 2
-            self._menu_footer_lbl.x = self.width // 2
-            # title - persistent
+            # ---- osu!-style main menu ----
+            cxw, cyw = self.width // 2, self.height // 2
+            # subtle animated background ring (lane colors, faint)
+            t = time.time()
+            # background vignette
+            vign = pyglet.shapes.Rectangle(0, 0, self.width, self.height, color=(8, 8, 16))
+            vign.draw()
+            # faint converging-beat ring motif behind logo
+            for i, lane in enumerate(LANE_ORDER):
+                col = LANES[lane]['color']
+                cc = pyglet.shapes.Circle(cxw, cyw + 40, 150 - i*18, color=col)
+                cc.opacity = int(16 + 12 * (0.5 + 0.5 * math.sin(t * 1.4 + i)))
+                cc.draw()
+            # logo
+            self._menu_title_lbl.x = cxw
+            self._menu_title_lbl.y = cyw + 150
             self._menu_title_lbl.draw()
+            # sub
+            self._menu_sub_lbl.x = cxw
+            self._menu_sub_lbl.y = cyw + 112
             self._menu_sub_lbl.draw()
-            self._menu_songs_hint_lbl.text = f"songs in  ./songs/  ({len(self.song_files)} found)  •  add mp4 / mp3 / wav and press SONGS"
+            # song count hint
+            self._menu_songs_hint_lbl.text = f"{len(self.song_files)} track(s) in  ./songs/  •  press O to open an external file"
+            self._menu_songs_hint_lbl.x = cxw
+            self._menu_songs_hint_lbl.y = cyw + 86
             self._menu_songs_hint_lbl.draw()
 
-            # menu options as boxes - reuse persistent shapes (no alloc)
-            for idx, opt in enumerate(self.menu_options):
-                y = 360 - idx*60 + (self.height - WINDOW_H)//2
-                selected = idx == self.menu_index
-                bg = self._menu_bg_rects[idx]
-                bg.x = self.width // 2 - 210
-                bg.y = y - 22
-                bg.color = (55, 55, 90) if selected else (28, 28, 42)
-                border = self._menu_border_rects[idx]
-                border.x = self.width // 2 - 211
-                border.y = y - 23
-                accent = self._menu_accent_rects[idx]
-                accent.x = self.width // 2 - 210
-                accent.y = y - 22
-                # draw order: border behind, bg, accent
-                if selected:
-                    border.visible = True
-                    accent.visible = True
-                    border.draw()
-                    bg.draw()
-                    accent.draw()
-                else:
-                    border.visible = False
-                    accent.visible = False
-                    bg.draw()
-                # label
-                lbl = self._menu_option_lbls[idx]
-                lbl.y = y
-                txt_col = (255,255,120,255) if selected else (220,220,240,255)
-                lbl.color = (*txt_col, 255)
-                lbl.weight = 'bold' if selected else 'normal'
-                lbl.text = opt
-                lbl.draw()
+            # primary PLAY pill button
+            play_w, play_h = 320, 72
+            px, py = cxw - play_w // 2, cyw - play_h // 2
+            play_sel = self.menu_index == 0
+            glow = pyglet.shapes.Rectangle(px - 12, py - 12, play_w + 24, play_h + 24, color=(100, 255, 160))
+            glow.opacity = int(60 + 30 * (0.5 + 0.5 * math.sin(t * 3.0)))
+            if play_sel:
+                glow.draw()
+            bg = pyglet.shapes.Rectangle(px, py, play_w, play_h, color=(70, 90, 130) if play_sel else (34, 42, 64))
+            bg.draw()
+            # accent bar
+            accent = pyglet.shapes.Rectangle(px, py, 8, play_h, color=(100, 255, 160))
+            accent.draw()
+            play_lbl = self._menu_option_lbls[0]
+            play_lbl.text = "PLAY"
+            play_lbl.x = cxw
+            play_lbl.y = cyw
+            play_lbl.font_size = 30
+            play_lbl.color = (255, 255, 255, 255) if play_sel else (200, 215, 245, 255)
+            play_lbl.draw()
 
-            # footer - persistent
+            # secondary buttons: OPEN FILE / QUIT
+            for idx in (1, 2):
+                opt = self.menu_options[idx]
+                wy = cyw - 130 - (idx - 1) * 46
+                selected = idx == self.menu_index
+                w = 240
+                wbg = pyglet.shapes.Rectangle(cxw - w // 2, wy - 18, w, 36, color=(46, 56, 84) if selected else (24, 28, 44))
+                wbg.draw()
+                if selected:
+                    wacc = pyglet.shapes.Rectangle(cxw - w // 2, wy - 18, 5, 36, color=(120, 180, 255))
+                    wacc.draw()
+                wlbl = self._menu_option_lbls[idx]
+                wlbl.text = opt
+                wlbl.x = cxw
+                wlbl.y = wy
+                wlbl.font_size = 15
+                wlbl.color = (255, 255, 140, 255) if selected else (180, 190, 220, 255)
+                wlbl.draw()
+
+            # footer
+            self._menu_footer_lbl.x = cxw
+            self._menu_footer_lbl.y = 70
             self._menu_footer_lbl.draw()
-            # lane legend - reuse persistent circles/labels (dynamic for fullscreen)
+            # lane legend
             for i, lane in enumerate(LANE_ORDER):
                 c = self._menu_lane_circles[i]
-                xs = self.width // 2 - 160 + i*90
+                xs = cxw - 160 + i * 90
                 c.x = xs + 16
                 c.y = 30
                 c.draw()
                 lbl = self._menu_lane_lbls[i]
-                lbl.x = xs+34
+                lbl.x = xs + 34
                 lbl.y = 30
                 lbl.text = lane.upper()
                 lbl.draw()
             return
 
         if self.state == "song_select":
-            self._draw_label("SELECT SONG", x=WINDOW_W//2, y=WINDOW_H - 50, size=26, color=(255,255,255,255), anchor_x='center', anchor_y='center', weight='bold')
-            self._draw_label(f"./songs/  •  {len(self.song_files)} track(s)  •  R refresh  •  O open external  •  B/ESC back", x=WINDOW_W//2, y=WINDOW_H - 80, size=10, color=(140,160,190,255), anchor_x='center', anchor_y='center', font_name='Consolas')
-            # panel
-            panel_x, panel_y, panel_w, panel_h = 200, 100, 880, 460
-            panel = pyglet.shapes.Rectangle(panel_x, panel_y, panel_w, panel_h, color=(18,18,30))
-            panel.draw()
-            # inner border
-            # list
-            if not self.song_files:
-                self._draw_label("No songs found.", x=WINDOW_W//2, y=panel_y + panel_h//2 + 20, size=14, color=(255,220,120,255), anchor_x='center', anchor_y='center', weight='bold')
-                self._draw_label("Drop .mp4 / .mp3 / .wav / .m4a / .ogg / .flac into  songs/  folder", x=WINDOW_W//2, y=panel_y + panel_h//2 -10, size=10, color=(180,180,210,255), anchor_x='center', anchor_y='center', font_name='Consolas')
-                self._draw_label("then press  R  to refresh", x=WINDOW_W//2, y=panel_y + panel_h//2 -30, size=10, color=(180,180,210,255), anchor_x='center', anchor_y='center', font_name='Consolas')
-                # show demo hint
-                self._draw_label("or press  O  to open a file outside songs/", x=WINDOW_W//2, y=panel_y + 40, size=9, color=(120,140,170,255), anchor_x='center', anchor_y='center', font_name='Consolas')
+            # ---- osu!-style song select: full-bleed preview + vertical carousel ----
+            cx = WINDOW_W // 2
+            base_y = WINDOW_H // 2
+            sel = None
+            if self.song_files:
+                try:
+                    si = max(0, min(len(self.song_files)-1, self.song_index))
+                    sel = self.song_files[si]
+                except Exception:
+                    sel = None
+            # 1) full-bleed dimmed preview of the selected song (live from preview player)
+            if sel is not None:
+                shot = self._draw_song_preview(0, 0, WINDOW_W, WINDOW_H, str(sel))
+                if not shot:
+                    # themed placeholder gradient-ish (layered rects)
+                    for i in range(5):
+                        pc = pyglet.shapes.Rectangle(0, 0, WINDOW_W, WINDOW_H, color=(10 + i*4, 12 + i*4, 26))
+                        pc.opacity = 255
+                        pc.draw()
             else:
-                max_visible = 10
-                start = self.songs_scroll
-                end = min(len(self.song_files), start + max_visible)
-                for i in range(start, end):
-                    p = self.song_files[i]
-                    rel = i - start
-                    y = 520 - rel*36
-                    selected = i == self.song_index
-                    # row bg
-                    if selected:
-                        row = pyglet.shapes.Rectangle(panel_x+10, y-14, panel_w-20, 28, color=(48,48,82))
-                        row.draw()
-                        # accent bar
-                        acc = pyglet.shapes.Rectangle(panel_x+10, y-14, 4, 28, color=(100,255,160))
-                        acc.draw()
-                    # icon
-                    # file name shorten to 48 chars
-                    name = p.name
-                    if len(name) > 52:
-                        name = name[:49] + "..."
-                    # size / ext
-                    try:
-                        sz_mb = p.stat().st_size / (1024*1024)
-                        sz_str = f"{sz_mb:.1f} MB"
-                    except:
-                        sz_str = ""
-                    ext = p.suffix.lower()
-                    icon_col = (255,74,74) if ext in (".mp4",".mov",".mkv",".avi",".webm",".m4v") else (100,200,255)
-                    dot = pyglet.shapes.Circle(panel_x+26, y, 6, color=icon_col)
-                    dot.draw()
-                    col = (255,255,140,255) if selected else (220,220,240,255)
-                    weight = 'bold' if selected else 'normal'
-                    self._draw_label(name, x=panel_x+44, y=y, size=11, color=(*col[:3],255), anchor_x='left', anchor_y='center', font_name='Consolas', weight=weight)
-                    self._draw_label(sz_str, x=panel_x+panel_w-20, y=y, size=9, color=(140,150,180,255), anchor_x='right', anchor_y='center', font_name='Consolas')
-                # scroll indicator
-                if len(self.song_files) > max_visible:
-                    track_h = panel_h - 20
-                    thumb_h = max(20, track_h * max_visible / len(self.song_files))
-                    thumb_y = panel_y + 10 + (track_h - thumb_h) * (self.songs_scroll / max(1, len(self.song_files)-max_visible))
-                    track = pyglet.shapes.Rectangle(panel_x+panel_w-8, panel_y+10, 4, track_h, color=(40,40,60))
-                    track.draw()
-                    thumb = pyglet.shapes.Rectangle(panel_x+panel_w-8, thumb_y, 4, thumb_h, color=(120,140,190))
-                    thumb.draw()
-                # footer inside panel
-                self._draw_label(f"{self.song_index+1} / {len(self.song_files)}", x=panel_x+16, y=panel_y+14, size=9, color=(120,140,170,255), anchor_x='left', anchor_y='center', font_name='Consolas')
-                self._draw_label("ENTER play  •  UP/DOWN navigate", x=panel_x+panel_w//2, y=panel_y+14, size=9, color=(120,140,170,255), anchor_x='center', anchor_y='center', font_name='Consolas')
-            # feedback line at bottom
+                bg = pyglet.shapes.Rectangle(0, 0, WINDOW_W, WINDOW_H, color=(10, 10, 18))
+                bg.draw()
+            # dim overlay for readability
+            dim = pyglet.shapes.Rectangle(0, 0, WINDOW_W, WINDOW_H, color=(6, 6, 16))
+            dim.opacity = 170
+            dim.draw()
+
+            if not self.song_files:
+                self._draw_label("No songs found.", x=cx, y=base_y + 40, size=18, color=(255, 220, 120, 255), anchor_x='center', anchor_y='center', weight='bold')
+                self._draw_label("Drop mp4 / mp3 / wav / m4a / ogg / flac into  songs/  then press  R", x=cx, y=base_y - 5, size=11, color=(190, 200, 225, 255), anchor_x='center', anchor_y='center', font_name='Consolas')
+                self._draw_label("or press  O  to open a file outside  songs/", x=cx, y=base_y - 30, size=10, color=(130, 145, 175, 255), anchor_x='center', anchor_y='center', font_name='Consolas')
+                self._draw_label("B / ESC : back", x=cx, y=40, size=10, color=(150, 160, 190, 255), anchor_x='center', anchor_y='center', font_name='Consolas')
+                return
+
+            # ---- left: selected song details + difficulty preview ----
+            name = sel.name
+            disp = name if len(name) <= 34 else name[:31] + "..."
+            self._draw_label(disp, x=190, y=base_y + 150, size=26, color=(255, 255, 255, 255), anchor_x='center', anchor_y='center', weight='bold')
+            # subtitle: size / ext / duration-ish
+            sub_parts = []
+            try:
+                sz_mb = sel.stat().st_size / (1024*1024)
+                sub_parts.append(f"{sz_mb:.1f} MB")
+            except: pass
+            sub_parts.append(sel.suffix.lstrip('.').upper())
+            meta = {}
+            try:
+                meta = self._load_song_difficulty_meta(str(sel))
+            except: pass
+            if meta:
+                cached = sum(1 for v in meta.values() if v)
+                sub_parts.append(f"{cached}/3 beatmaps cached")
+            self._draw_label("  •  ".join(sub_parts), x=190, y=base_y + 118, size=11, color=(150, 170, 205, 255), anchor_x='center', anchor_y='center', font_name='Consolas')
+
+            # difficulty buttons (left preview of what ENTER leads to)
+            for idx, opt in enumerate(self.difficulty_options):
+                by = base_y + 40 - idx * 62
+                selected_d = idx == self.difficulty_index
+                bcol = (70, 96, 140) if selected_d else (30, 40, 66)
+                btn = pyglet.shapes.Rectangle(60, by - 24, 260, 48, color=bcol)
+                btn.draw()
+                if selected_d:
+                    accc = pyglet.shapes.Rectangle(60, by - 24, 6, 48, color=(100, 255, 160))
+                    accc.draw()
+                lbl = self._draw_label(opt, x=80, y=by + 4, size=16, color=(255, 255, 200, 255) if selected_d else (215, 220, 240, 255), anchor_x='left', anchor_y='center', weight='bold')
+                # rating / beats for this difficulty if cached
+                m = meta.get(opt.lower())
+                if m:
+                    r, bts = m
+                    self._draw_label(f"d{r}  •  {bts} beats", x=300, y=by, size=10, color=(140, 210, 150, 255), anchor_x='right', anchor_y='center', font_name='Consolas')
+            # hint under difficulty buttons
+            self._draw_label("1/2/3 or LEFT/RIGHT: difficulty  •  ENTER: play this song", x=190, y=base_y - 95, size=10, color=(120, 140, 175, 255), anchor_x='center', anchor_y='center', font_name='Consolas')
+
+            # ---- right: vertical carousel of song cards (selected pulled out) ----
+            play_pull = self.sc_selected_pull  # 0..1
+            # determine visible window (approx 7 songs for 112px step within 720 height)
+            vis_half = 4
+            i0 = max(0, self.song_index - vis_half)
+            i1 = min(len(self.song_files) - 1, self.song_index + vis_half)
+            cw, ch = 320, 96
+            for i in range(i0, i1 + 1):
+                p = self.song_files[i]
+                rel = i - self.song_index
+                cy = base_y + self.sc_scroll + i * 112.0
+                selected = i == self.song_index
+                # pull the selected card toward the front (scale + brighter + gap)
+                if selected:
+                    scale = 1.0 + 0.16 * play_pull
+                    xoff = -40 * play_pull
+                    col_bg = (66, 92, 140)
+                    alpha = 255
+                else:
+                    scale = 1.0
+                    xoff = 0.0
+                    dist = abs(rel)
+                    alpha = max(60, 160 - dist * 45)
+                    col_bg = (26, 32, 52)
+                w = cw * scale
+                h = ch * scale
+                x0 = WINDOW_W - w - 40 + xoff
+                y0 = cy - h / 2
+                # card panel
+                card = pyglet.shapes.Rectangle(x0, y0, w, h, color=col_bg)
+                card.opacity = alpha
+                card.draw()
+                if selected:
+                    bord = pyglet.shapes.Rectangle(x0 + w - 5, y0, 5, h, color=(100, 255, 160))
+                    bord.draw()
+                # name inside card
+                nm = p.name
+                if len(nm) > 26:
+                    nm = nm[:23] + "..."
+                tcol = (255, 255, 255, 255) if selected else (200, 210, 235, 255)
+                self._draw_label(nm, x=x0 + 16, y=cy + 10, size=14, color=tcol, anchor_x='left', anchor_y='center', weight='bold' if selected else 'normal')
+                # subtitle: ext / size
+                try:
+                    s2 = f"{p.stat().st_size/(1024*1024):.1f} MB"
+                except:
+                    s2 = p.suffix.lstrip('.').upper()
+                self._draw_label(f"{p.suffix.lstrip('.').upper()}  •  {s2}", x=x0 + 16, y=cy - 20, size=9, color=(140, 155, 185, 255), anchor_x='left', anchor_y='center', font_name='Consolas')
+            # scroll handle hint (index / total)
+            self._draw_label(f"{self.song_index+1} / {len(self.song_files)}", x=WINDOW_W - 40, y=WINDOW_H - 40, size=12, color=(200, 210, 240, 255), anchor_x='right', anchor_y='center', weight='bold', font_name='Consolas')
+
+            # bottom bar
+            self._draw_label("UP/DOWN or W/S : browse   •   ENTER : choose difficulty   •   R refresh   •   B/ESC : back", x=cx, y=24, size=10, color=(150, 160, 190, 255), anchor_x='center', anchor_y='center', font_name='Consolas')
+            # feedback
             if self.feedback_text and (time.time() - self.feedback_time) < 3.0:
                 age = time.time() - self.feedback_time
                 alpha = int(180 * (1 - age/3.0))
-                self._draw_label(self.feedback_text, x=WINDOW_W//2, y=60, size=10, color=(*self.feedback_color[:3], max(0,alpha)), anchor_x='center', anchor_y='center', font_name='Consolas')
+                self._draw_label(self.feedback_text, x=cx, y=64, size=11, color=(*self.feedback_color[:3], max(0, alpha)), anchor_x='center', anchor_y='center', font_name='Consolas')
             return
+
 
         if self.state == "difficulty_select":
             self._draw_label("CHOOSE DIFFICULTY", x=WINDOW_W//2, y=WINDOW_H - 70, size=26, color=(255,255,255,255), anchor_x='center', anchor_y='center', weight='bold')
