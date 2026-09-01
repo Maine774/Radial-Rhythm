@@ -87,8 +87,10 @@ I've included `_example_beats.wav` in `songs/` so the browser is never empty.
 - `SPACE` pause/resume, `ESC` → menu (stops music)
 - `+`/`-` or `[`/`]` adjust sensitivity (re-open song to apply) before loading
 
-Scoring: `PERFECT ±130ms` 300, `GOOD ±260ms` 150, `OK ±350ms` 50, else `MISS`.
-Combo multiplier caps at 2.0×.
+Scoring: `PERFECT ±130ms` 300, `GOOD ±260ms` 200, `MEH ±350ms` 100, else `MISS` (0).
+Combo multiplier caps at 2.0×. Perfect hits build a **perfect combo (FC)**; any non-perfect
+breaks it. Result grade from score / max-possible: **A ≥90% / B 70–89% / C 50–69% / D <50%**.
+Every lane keypress during a song plays the click SFX (`SFX/clickfx.mp3`, volume = FX volume).
 
 ## How a beatmap is made (`main.py:detect_beats_madmom`)
 1. `extract_wav_with_ffmpeg()` → high-quality mono WAV.

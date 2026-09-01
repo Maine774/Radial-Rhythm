@@ -1,7 +1,7 @@
 # Radial Rhythm — Game Plan
 
 > Codebase: `C:\Users\LOK0008\rhythmgame\main.py` (~3000 lines, `pyglet 2.1.16`, `numpy 2.5.2`, `madmom 0.16.1`, `librosa 1.0.0`)
-> State machine: `self.state` (`main.py`) — `menu | song_select | difficulty_select | analyzing | playing | paused | results | settings`
+> State machine: `self.state` (`main.py`) — `menu | song_select | difficulty_select | analyzing | playing | paused | results | settings | keybinds`
 
 ---
 
@@ -40,11 +40,17 @@ voice-first logic at different densities.
 
 ### 1.2 Scoring
 
-`HIT_WINDOW_PERFECT=0.13s → 300pts`, `GOOD 0.26s → 150`, `OK 0.35s → 50`, else `MISS`.
-`try_hit()` picks the closest `active_beats` within `OK`. Combo `combo++` per hit, `max_combo`
+`HIT_WINDOW_PERFECT=0.13s → 300pts`, `GOOD 0.26s → 200`, `MEH 0.35s → 100`, else `MISS` (0).
+`try_hit()` picks the closest `active_beats` within `MEH` and always plays the keypress SFX
+(`SFX/clickfx.mp3`, volume = `fx_volume`). Combo `combo++` per hit, `max_combo`
 tracked, multiplier `1 + min(combo//8,4)*0.25` max `2.0×` at 32. `MISS` (timeout `>0.35` in
-`update` or wrong lane) resets `combo=0`. Accuracy on results:
-`(perfect*1.0 + good*0.7 + ok*0.4)/total*100`.
+`update` or wrong lane) resets `combo=0`. **Perfect combo (FC)** `fc++` on perfect only;
+any other result calls `_break_fc()` (`fc=0`), tracked in `max_fc`. Grade = `score / max
+possible (all-perfect sim)` → **A ≥90% / B 70–89% / C 50–69% / D <50%**. Accuracy on results:
+`(perfect*1.0 + good*0.85 + meh*0.6)/total*100`.
+Settings (persisted `config.json`): `input_latency` (feeds `beat_offset`), `music_volume`
+(player + preview at ×0.5), `fx_volume`, `video_brightness` (video dim), `lane_alpha` (lane/beat
+opacity), plus editable `keybinds` rebuilding global `KEY_TO_LANE`.
 
 ### 1.3 Beatmap Philosophy
 
