@@ -68,6 +68,28 @@ HIT_WINDOW_OK = 0.35
 SECTION_GAP_THRESHOLD = 2.0
 SPIRAL_TURNS_DEG = 90.0
 
+def spiral_point(hit_ang, cw, raw):
+    """(x, y, deg_angle) of a note spiraling inward from its predecessor's side
+    (raw=0, SPAWN_RADIUS) to its own lane side (raw=1, TARGET_RADIUS)."""
+    radius = SPAWN_RADIUS - raw * (SPAWN_RADIUS - TARGET_RADIUS)
+    if radius < TARGET_RADIUS:
+        radius = TARGET_RADIUS
+    if cw:
+        ang = (hit_ang + 90.0) - raw * SPIRAL_TURNS_DEG
+    else:
+        ang = (hit_ang - 90.0) + raw * SPIRAL_TURNS_DEG
+    a = math.radians(ang)
+    return math.cos(a) * radius, math.sin(a) * radius
+
+def spiral_guide_points(hit_ang, cw=True, segs=20):
+    """Polyline points (in window coords) tracing the spiral lane path."""
+    cx, cy = CENTER
+    pts = []
+    for i in range(segs + 1):
+        x, y = spiral_point(hit_ang, cw, i / segs)
+        pts.append((cx + x, cy + y))
+    return pts
+
 LANES = {
     'd': {'angle': 180, 'color': (255, 74, 74),  'key': key.D, 'label': 'D'},
     'f': {'angle': 90,  'color': (74, 144, 255), 'key': key.F, 'label': 'F'},
@@ -1103,15 +1125,20 @@ class RhythmGame(pyglet.window.Window):
         self._lane_outer_shapes = {}
         cx, cy = CENTER
         for lane_key, info in LANES.items():
-            ang = math.radians(info['angle'])
-            x1 = cx + math.cos(ang) * TARGET_RADIUS
-            y1 = cy + math.sin(ang) * TARGET_RADIUS
-            x2 = cx + math.cos(ang) * SPAWN_RADIUS
-            y2 = cy + math.sin(ang) * SPAWN_RADIUS
+            hit_ang = info['angle']
             col = info['color']
-            self._lane_line_shapes[lane_key] = pyglet.shapes.Line(x1, y1, x2, y2, thickness=2, color=(*col, 60), batch=self.game_batch)
-            sx = cx + math.cos(ang) * SPAWN_RADIUS
-            sy = cy + math.sin(ang) * SPAWN_RADIUS
+            # Curved lane guides: draw the clockwise spiral path each note follows,
+            # from the predecessor lane's spawn side winding to this lane's side.
+            pts = spiral_guide_points(hit_ang, cw=True, segs=18)
+            segs = []
+            for i in range(len(pts) - 1):
+                seg = pyglet.shapes.Line(pts[i][0], pts[i][1], pts[i+1][0], pts[i+1][1],
+                                         thickness=2, color=(*col, 60), batch=self.game_batch)
+                segs.append(seg)
+            self._lane_line_shapes[lane_key] = segs
+            # outer spawn ring sits where the spiral begins = predecessor lane's side
+            sx = cx + math.cos(math.radians((hit_ang + 90.0) % 360.0)) * SPAWN_RADIUS
+            sy = cy + math.sin(math.radians((hit_ang + 90.0) % 360.0)) * SPAWN_RADIUS
             self._lane_outer_bg_shapes[lane_key] = pyglet.shapes.Circle(sx, sy, 14, color=(*col, 90), batch=self.game_batch)
             self._lane_outer_shapes[lane_key] = pyglet.shapes.Circle(sx, sy, 10, color=col, batch=self.game_batch)
         # center target pooled (batched) - hide non-essential for 60fps
@@ -2339,9 +2366,9 @@ class RhythmGame(pyglet.window.Window):
             alpha = 60 + int(flash * 180)
             alpha = min(255, alpha)
             width = 2 + flash * 4
-            line = self._lane_line_shapes[lane_key]
-            line.thickness = width
-            line.color = (*col, alpha)
+            for line in self._lane_line_shapes[lane_key]:
+                line.thickness = width
+                line.color = (*col, alpha)
             bg = self._lane_outer_bg_shapes[lane_key]
             bg.radius = 14 + flash*6
             bg.opacity = 90 + int(flash*100)
@@ -2360,15 +2387,8 @@ class RhythmGame(pyglet.window.Window):
                     glow.opacity = 0
 
     def _spiral_xy(self, cx, cy, b, raw):
-        radius = SPAWN_RADIUS - raw * (SPAWN_RADIUS - TARGET_RADIUS)
-        if radius < TARGET_RADIUS:
-            radius = TARGET_RADIUS
-        if b.get('cw', True):
-            ang = b['start_ang'] - raw * SPIRAL_TURNS_DEG
-        else:
-            ang = b['start_ang'] + raw * SPIRAL_TURNS_DEG
-        ang = math.radians(ang)
-        return cx + math.cos(ang) * radius, cy + math.sin(ang) * radius
+        px, py = spiral_point(b['angle'], b.get('cw', True), raw)
+        return cx + px, cy + py
 
     def _draw_spiral_ghost(self, slot, b):
         segs = slot['ghost']

@@ -1,5 +1,6 @@
 pyglet>=2.0
 numpy
-# optional for better beat detection - install if you want more accurate sync:
-# librosa
-# moviepy
+# optional for better beat detection - I found madmom gives the most accurate sync:
+# (Python 3.14 users: pip install --no-build-isolation "setuptools<82" then --no-build-isolation madmom==0.16.1)
+# madmom==0.16.1
+# scipy

@@ -1,21 +1,27 @@
 # Radial Rhythm Game — Pyglet
 
-Beats fly from the **outside of the screen into the centre** along 4 coloured lanes.
-Your music is turned into a beatmap **synced to the actual voice/melody** (via `madmom`),
-not a metronome, so the notes follow what you sing/what you hear.
+It's a radial rhythm game I built in Pyglet. Beats fly in from the **outside of the
+screen and curve into the centre** along 4 coloured lanes, and I've made it so your
+music gets turned into a beatmap **synced to the actual voice/melody** (via `madmom`),
+not a metronome — so the notes follow what you sing or what you hear.
 
-| Lane | Key | Colour | Direction |
-|------|-----|--------|-----------|
+| Lane | Key | Colour | Ends at |
+|------|-----|--------|---------|
 | D | D | Red `#FF4A4A` | Left (180°) |
 | F | F | Blue `#4A90FF` | Top (90°) |
 | J | J | Green `#4AFF8A` | Right (0°) |
 | K | K | Yellow `#FFD74A` | Bottom (270°) |
 
+Each note **spirals in** instead of coming in a straight line: it starts on the side of
+the lane before it and winds 90° clockwise to reach the centre on its own side. When the
+song moves onto a new section (a big gap), that first note winds the other way and I
+telegraph it with a faint ghost arc so you can see the direction coming.
+
 Hit the key when the beat reaches the centre ring.
 
 ## Features
 - **Main Menu** → `PLAY` / `OPEN FILE` / `SETTINGS` / `QUIT` (osu!-style big-play-button layout).
-- **osu!-style song select**: vertical carousel with the selected card "pulled out",
+- **osu!-style song select**: a vertical carousel with the selected card "pulled out",
   a **live video preview** (full-bleed background, ≥30 fps) and a **song-colour accent**
   (the selected card + difficulty tab are tinted with the song's average colour, extracted
   with `ffmpeg` and cached).
@@ -55,7 +61,7 @@ python main.py "C:\path\to\song.mp4"
 #   songs/my_song.mp4 -> appears in the PLAY song select
 ```
 
-`_example_beats.wav` is included in `songs/` so the browser is never empty.
+I've included `_example_beats.wav` in `songs/` so the browser is never empty.
 
 ## Controls
 ### Menu
