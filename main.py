@@ -62,6 +62,11 @@ TRAVEL_TIME = 1.6
 HIT_WINDOW_PERFECT = 0.13
 HIT_WINDOW_GOOD = 0.26
 HIT_WINDOW_OK = 0.35
+# Spiral approach: each note winds 90 degrees inward from its predecessor lane's
+# side to its own lane's side. A gap larger than this to the previous note marks a
+# new musical section, and that note coils counterclockwise as a telegraph.
+SECTION_GAP_THRESHOLD = 2.0
+SPIRAL_TURNS_DEG = 90.0
 
 LANES = {
     'd': {'angle': 180, 'color': (255, 74, 74),  'key': key.D, 'label': 'D'},
@@ -1143,7 +1148,15 @@ class RhythmGame(pyglet.window.Window):
             tail.visible = False
             hit_circ = pyglet.shapes.Circle(0, 0, 28, color=(255,255,255), batch=self.game_batch)
             hit_circ.visible = False
-            self._beat_pool.append({'circle': circ, 'inner': inner, 'tail': tail, 'hit': hit_circ, 'in_use': False})
+            # ghost spiral arc (telegraph for counterclockwise/new-section notes):
+            # a faint multi-segment path showing the upcoming coil direction
+            ghost_pts = 16
+            ghost_segs = []
+            for s in range(ghost_pts - 1):
+                ln = pyglet.shapes.Line(0, 0, 0, 0, thickness=2, color=(220, 240, 255, 90), batch=self.game_batch)
+                ln.visible = False
+                ghost_segs.append(ln)
+            self._beat_pool.append({'circle': circ, 'inner': inner, 'tail': tail, 'hit': hit_circ, 'ghost': ghost_segs, 'in_use': False})
 
         # ---- persistent labels for 60fps (avoid _draw_label cache lookup per frame) ----
         self._lane_text_labels = {}
@@ -1750,11 +1763,24 @@ class RhythmGame(pyglet.window.Window):
             bt_eff = bt + self.beat_offset
             if bt_eff - song_t <= TRAVEL_TIME + 0.05:
                 if bt_eff >= song_t - HIT_WINDOW_OK:
-                    ang = LANES[lane]['angle']
+                    hit_ang = LANES[lane]['angle']
+                    # Clockwise spiral: start 90deg before (predecessor in the CW
+                    # chain yellow->red->blue->green->yellow = +90deg) and wind inward.
+                    prev_t = self.active_beats[-1]['time'] if self.active_beats else None
+                    is_new_section = (
+                        prev_t is None or (bt_eff - prev_t) > SECTION_GAP_THRESHOLD
+                    )
+                    cw = not is_new_section
+                    if cw:
+                        start_ang = (hit_ang + 90.0) % 360.0
+                    else:
+                        start_ang = (hit_ang - 90.0) % 360.0
                     self.active_beats.append({
                         'time': bt_eff,
                         'lane': lane,
-                        'angle': ang,
+                        'angle': hit_ang,
+                        'start_ang': start_ang,
+                        'cw': cw,
                         'hit': False,
                         'spawn_t': song_t,
                     })
@@ -2333,6 +2359,39 @@ class RhythmGame(pyglet.window.Window):
                     glow.visible = False
                     glow.opacity = 0
 
+    def _spiral_xy(self, cx, cy, b, raw):
+        radius = SPAWN_RADIUS - raw * (SPAWN_RADIUS - TARGET_RADIUS)
+        if radius < TARGET_RADIUS:
+            radius = TARGET_RADIUS
+        if b.get('cw', True):
+            ang = b['start_ang'] - raw * SPIRAL_TURNS_DEG
+        else:
+            ang = b['start_ang'] + raw * SPIRAL_TURNS_DEG
+        ang = math.radians(ang)
+        return cx + math.cos(ang) * radius, cy + math.sin(ang) * radius
+
+    def _draw_spiral_ghost(self, slot, b):
+        segs = slot['ghost']
+        cx, cy = CENTER
+        n = len(segs) + 1
+        prev = self._spiral_xy(cx, cy, b, 0.0)
+        for i in range(len(segs)):
+            q = (i + 1) / (n - 1)
+            x, y = self._spiral_xy(cx, cy, b, q)
+            ln = segs[i]
+            ln.x = prev[0]; ln.y = prev[1]
+            ln.x2 = x; ln.y2 = y
+            ln.visible = True
+            prev = (x, y)
+
+    def _hide_beat_slot(self, slot):
+        slot['circle'].visible = False
+        slot['inner'].visible = False
+        slot['tail'].visible = False
+        slot['hit'].visible = False
+        for ln in slot['ghost']:
+            ln.visible = False
+
     def _draw_beats(self, song_t):
         cx, cy = CENTER
         # Visible toggle is faster than opacity 0 (batch skips invisible)
@@ -2351,10 +2410,7 @@ class RhythmGame(pyglet.window.Window):
                 elapsed = song_t - b['miss_time']
                 prog = elapsed / 0.45
                 if prog >= 1:
-                    circ.visible = False
-                    inner_c.visible = False
-                    tail.visible = False
-                    hit_circ.visible = False
+                    self._hide_beat_slot(slot)
                     pool_idx += 1
                     continue
                 ang = math.radians(b['angle'])
@@ -2371,6 +2427,8 @@ class RhythmGame(pyglet.window.Window):
                 inner_c.visible = False
                 tail.visible = False
                 hit_circ.visible = False
+                for ln in slot['ghost']:
+                    ln.visible = False
                 pool_idx += 1
                 continue
             if b['hit']:
@@ -2378,10 +2436,7 @@ class RhythmGame(pyglet.window.Window):
                 if delta < 0: delta = 0
                 prog = delta / 0.25
                 if prog > 1:
-                    circ.visible = False
-                    inner_c.visible = False
-                    tail.visible = False
-                    hit_circ.visible = False
+                    self._hide_beat_slot(slot)
                     pool_idx += 1
                     continue
                 ang = math.radians(b['angle'])
@@ -2396,27 +2451,21 @@ class RhythmGame(pyglet.window.Window):
                 circ.visible = False
                 inner_c.visible = False
                 tail.visible = False
+                for ln in slot['ghost']:
+                    ln.visible = False
                 pool_idx += 1
                 continue
             raw = (song_t - (b['time'] - TRAVEL_TIME)) / TRAVEL_TIME if self.is_playing else 0.0
             if not self.is_playing:
-                circ.visible = False; inner_c.visible = False; tail.visible = False; hit_circ.visible = False
+                self._hide_beat_slot(slot)
                 pool_idx += 1
                 continue
             if raw < 0: raw = 0
             if raw > 1.2:
-                circ.visible = False; inner_c.visible = False; tail.visible = False; hit_circ.visible = False
+                self._hide_beat_slot(slot)
                 pool_idx += 1
                 continue
-            radius = SPAWN_RADIUS - raw * (SPAWN_RADIUS - TARGET_RADIUS)
-            if radius < TARGET_RADIUS:
-                radius = TARGET_RADIUS
-            ang = math.radians(b['angle'])
-            x = cx + math.cos(ang) * radius
-            y = cy + math.sin(ang) * radius
-            tail_len = 18
-            tx = cx + math.cos(ang) * (radius + tail_len)
-            ty = cy + math.sin(ang) * (radius + tail_len)
+            x, y = self._spiral_xy(cx, cy, b, raw)
             col = LANES[b['lane']]['color']
             scale = 0.9 + 0.35 * raw
             sz = 22 * scale
@@ -2427,14 +2476,17 @@ class RhythmGame(pyglet.window.Window):
             circ.visible = True
             inner_c.visible = False
             hit_circ.visible = False
+            # ghost spiral arc: telegraphs counterclockwise / new-section notes
+            if not b.get('cw', True):
+                self._draw_spiral_ghost(slot, b)
+            else:
+                for ln in slot['ghost']:
+                    ln.visible = False
             pool_idx += 1
         # hide leftover slots that were visible last frame
         for idx in range(pool_idx, prev_count):
             slot = self._beat_pool[idx]
-            slot['circle'].visible = False
-            slot['inner'].visible = False
-            slot['tail'].visible = False
-            slot['hit'].visible = False
+            self._hide_beat_slot(slot)
         self._beat_last_count = pool_idx
 
     def _draw_hud(self, song_t):
