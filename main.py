@@ -2133,6 +2133,12 @@ class RhythmGame(pyglet.window.Window):
             pl.queue(src)
             pl.volume = max(0.0, min(1.0, float(self.settings.get("fx_volume", 0.7))))
             pl.play()
+            # keep reference so it doesn't get GC'd before playing
+            if not hasattr(self, '_clickfx_players'):
+                self._clickfx_players = []
+            self._clickfx_players.append(pl)
+            # cleanup finished players
+            self._clickfx_players = [p for p in self._clickfx_players if p.playing]
         except Exception:
             pass
 
