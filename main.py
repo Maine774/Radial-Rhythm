@@ -1026,6 +1026,50 @@ def fill_beat_gaps(beatmap, duration, tempo_hint=120, sparse=False):
     return dedup
 
 # ------------------------------------------------------------
+# Reusable pooled rounded-rectangle bank for fast (60fps) UI drawing.
+# Screens fill slots each frame and the batch is drawn once, avoiding
+# the cost of constructing pyglet shapes per-frame in on_draw.
+# ------------------------------------------------------------
+class ShapeBank:
+    def __init__(self, n=256, default_radius=12):
+        self.batch = pyglet.graphics.Batch()
+        self.slots = []
+        self.used = 0
+        self.default_radius = default_radius
+        for _ in range(n):
+            r = pyglet.shapes.RoundedRectangle(0, 0, 1, 1, radius=default_radius,
+                                               color=(255, 255, 255), batch=self.batch)
+            r.visible = False
+            self.slots.append(r)
+
+    def reset(self):
+        for s in self.slots:
+            s.visible = False
+        self.used = 0
+
+    def rect(self, x, y, w, h, color, radius=None, opacity=255, visible=True):
+        """Grab the next free slot, position it and mark it visible.
+        Returns None if the bank is exhausted."""
+        if self.used >= len(self.slots):
+            return None
+        s = self.slots[self.used]
+        self.used += 1
+        s.x = x
+        s.y = y
+        s.width = w
+        s.height = h
+        if radius is not None:
+            s.radius = radius
+        s.color = color
+        s.opacity = opacity
+        s.visible = visible
+        return s
+
+    def draw(self):
+        self.batch.draw()
+
+
+# ------------------------------------------------------------
 # Game Window
 # ------------------------------------------------------------
 class RhythmGame(pyglet.window.Window):
@@ -1208,6 +1252,7 @@ class RhythmGame(pyglet.window.Window):
 
         # ---- persistent menu shapes for 60fps ----
         self._menu_batch = pyglet.graphics.Batch()
+        self._shapes = ShapeBank()
         self._menu_bg_rects = []
         self._menu_border_rects = []
         self._menu_accent_rects = []
@@ -2305,7 +2350,11 @@ class RhythmGame(pyglet.window.Window):
     def _draw_label(self, text, x, y, size=12, color=(255,255,255,255), anchor_x='left', anchor_y='baseline', font_name='Arial', weight='normal', italic=False):
         # Wrapper to avoid bold kwarg issue + cache for 60fps performance
         # Reuse Label objects per style key to avoid glyph rebuild each frame
-        key = (font_name, int(size*10), weight, italic, anchor_x, anchor_y)
+        # Cache key must include the TEXT itself: many labels share a style but
+        # have different content, and reusing one Label object across different
+        # texts would overwrite each other before draw() — making text vanish.
+        # (Reuse per unique text+style keeps 60fps: no per-frame construction.)
+        key = (font_name, int(size*10), weight, italic, anchor_x, anchor_y, text)
         lbl = self._label_cache.get(key)
         if lbl is None:
             lbl = pyglet.text.Label(text, x=x, y=y, font_name=font_name, font_size=size, weight=weight, italic=italic, color=color, anchor_x=anchor_x, anchor_y=anchor_y)
@@ -2614,17 +2663,19 @@ class RhythmGame(pyglet.window.Window):
             self._video_sprite.opacity = 110  # dim so game visible
             self._video_sprite.draw()
             # dim overlay for readability
-            overlay = pyglet.shapes.Rectangle(0, 0, self.width, self.height, color=(6, 6, 14))
-            overlay.opacity = 140
-            overlay.draw()
+            S = self._shapes
+            S.reset()
+            S.rect(0, 0, self.width, self.height, (6, 6, 14), radius=0, opacity=140)
+            S.draw()
             return True
         except Exception as e:
             # fallback blit
             try:
                 tex.blit(0, 0, width=self.width, height=self.height)
-                overlay = pyglet.shapes.Rectangle(0, 0, self.width, self.height, color=(6, 6, 14))
-                overlay.opacity = 140
-                overlay.draw()
+                S = self._shapes
+                S.reset()
+                S.rect(0, 0, self.width, self.height, (6, 6, 14), radius=0, opacity=140)
+                S.draw()
                 return True
             except:
                 return False
@@ -2657,24 +2708,23 @@ class RhythmGame(pyglet.window.Window):
                 lbl.draw()
             # overlay for paused / results
             if self.state == "paused":
-                # dim
-                dim = pyglet.shapes.Rectangle(0, 0, WINDOW_W, WINDOW_H, color=(0,0,0))
-                dim.opacity = 120
-                dim.draw()
+                S = self._shapes
+                S.reset()
+                S.rect(0, 0, WINDOW_W, WINDOW_H, (0,0,0), radius=0, opacity=120)
+                S.draw()
                 self._draw_label("PAUSED", x=WINDOW_W//2, y=WINDOW_H//2 + 40, size=36, color=(255,255,255,255), anchor_x='center', anchor_y='center', weight='bold')
                 self._draw_label("SPACE to resume  |  ESC for menu", x=WINDOW_W//2, y=WINDOW_H//2 -10, size=12, color=(200,220,255,255), anchor_x='center', anchor_y='center', font_name='Consolas')
                 # fall through to HUD? not needed
             elif self.state == "results":
-                dim = pyglet.shapes.Rectangle(0, 0, WINDOW_W, WINDOW_H, color=(0,0,0))
-                dim.opacity = 130
-                dim.draw()
+                S = self._shapes
+                S.reset()
+                S.rect(0, 0, WINDOW_W, WINDOW_H, (0,0,0), radius=0, opacity=130)
                 card_w, card_h = 560, 360
                 card_x = (WINDOW_W - card_w)//2
                 card_y = (WINDOW_H - card_h)//2
-                bg = pyglet.shapes.Rectangle(card_x, card_y, card_w, card_h, color=(22,22,34))
-                bg.draw()
-                border = pyglet.shapes.Rectangle(card_x, card_y, card_w, card_h, color=(60,60,90))
-                # fake border via 4 lines
+                S.rect(card_x, card_y, card_w, card_h, (22,22,34), radius=18)
+                S.rect(card_x, card_y, card_w, card_h, (60,60,90), radius=18, opacity=90)
+                S.draw()
                 # title
                 self._draw_label("RESULTS", x=WINDOW_W//2, y=card_y+card_h-40, size=22, color=(255,255,120,255), anchor_x='center', anchor_y='center', weight='bold')
                 self._draw_label(f"Score  {self.score:06d}", x=WINDOW_W//2, y=card_y+card_h-90, size=18, color=(255,255,255,255), anchor_x='center', anchor_y='center', weight='bold')
@@ -2704,15 +2754,33 @@ class RhythmGame(pyglet.window.Window):
         if self.state == "analyzing":
             # analysis progress screen
             cx, cy = WINDOW_W//2, WINDOW_H//2
-            # dim bg
-            bg = pyglet.shapes.Rectangle(0, 0, WINDOW_W, WINDOW_H, color=(10, 10, 18))
-            bg.draw()
-            # card
+            S = self._shapes
+            S.reset()
+            # dim bg + rounded card
+            S.rect(0, 0, WINDOW_W, WINDOW_H, (10, 10, 18), radius=0)
             card_w, card_h = 700, 260
             card_x = (WINDOW_W - card_w)//2
             card_y = (WINDOW_H - card_h)//2
-            card = pyglet.shapes.Rectangle(card_x, card_y, card_w, card_h, color=(22, 22, 34))
-            card.draw()
+            S.rect(card_x, card_y, card_w, card_h, (22, 22, 34), radius=18)
+            # progress bar bg + fill (rounded)
+            bar_w, bar_h = 520, 18
+            bar_x = (WINDOW_W - bar_w)//2
+            bar_y = card_y + 90
+            S.rect(bar_x, bar_y, bar_w, bar_h, (40, 40, 60), radius=9)
+            prog = max(0.0, min(1.0, self.analysis_progress))
+            fill_w = int(bar_w * prog)
+            if fill_w > 0:
+                S.rect(bar_x, bar_y, fill_w, bar_h, (100, 220, 160), radius=9)
+            S.draw()
+            # shimmer (transient, on top)
+            if 0.02 < prog < 0.99 and fill_w > 3:
+                shimmer_w = 40
+                t = time.time() * 2.5
+                shimmer_x = bar_x + (int((t % 2.0) * (bar_w + shimmer_w)) - shimmer_w)
+                sx = max(bar_x, min(bar_x+fill_w - shimmer_w, shimmer_x))
+                sh = pyglet.shapes.Rectangle(sx, bar_y, shimmer_w, bar_h, color=(160, 255, 190))
+                sh.opacity = 90
+                sh.draw()
             # title
             self._draw_label("ANALYSING", x=WINDOW_W//2, y=card_y+card_h-40, size=22, weight='bold', color=(255, 220, 100, 255), anchor_x='center', anchor_y='center')
             fname = Path(self.media_path).name if self.media_path else "song"
@@ -2720,30 +2788,6 @@ class RhythmGame(pyglet.window.Window):
                 fname = fname[:45] + "..."
             self._draw_label(fname, x=WINDOW_W//2, y=card_y+card_h-80, size=11, color=(180, 180, 210, 255), anchor_x='center', anchor_y='center', font_name='Consolas')
             self._draw_label(self.analysis_msg or "Extracting beats...", x=WINDOW_W//2, y=card_y+card_h-110, size=10, color=(140, 160, 190, 255), anchor_x='center', anchor_y='center', font_name='Consolas')
-            # progress bar bg
-            bar_w, bar_h = 520, 18
-            bar_x = (WINDOW_W - bar_w)//2
-            bar_y = card_y + 90
-            bar_bg = pyglet.shapes.Rectangle(bar_x, bar_y, bar_w, bar_h, color=(40, 40, 60))
-            bar_bg.draw()
-            # progress fill
-            prog = max(0.0, min(1.0, self.analysis_progress))
-            # animate a little shimmer if progress stuck
-            fill_w = int(bar_w * prog)
-            if fill_w > 0:
-                bar_fg = pyglet.shapes.Rectangle(bar_x, bar_y, fill_w, bar_h, color=(100, 220, 160))
-                bar_fg.draw()
-                # shimmer
-                shimmer_w = 40
-                t = time.time() * 2.5
-                shimmer_x = bar_x + (int((t % 2.0) * (bar_w + shimmer_w)) - shimmer_w) if prog < 1.0 else bar_x
-                # only draw shimmer inside fill
-                if prog > 0.02 and prog < 0.99:
-                    # clip shimmer to fill
-                    sx = max(bar_x, min(bar_x+fill_w - shimmer_w, shimmer_x))
-                    sh = pyglet.shapes.Rectangle(sx, bar_y, shimmer_w, bar_h, color=(160, 255, 190))
-                    sh.opacity = 90
-                    sh.draw()
             self._draw_label(f"{int(prog*100)}%", x=WINDOW_W//2, y=bar_y+bar_h//2, size=10, weight='bold', color=(255, 255, 255, 255), anchor_x='center', anchor_y='center', font_name='Consolas')
             # cached hint
             self._draw_label("First load analyses via ffmpeg • next load is instant (cached)", x=WINDOW_W//2, y=card_y+45, size=9, color=(110, 120, 150, 255), anchor_x='center', anchor_y='center', font_name='Consolas')
@@ -2754,17 +2798,40 @@ class RhythmGame(pyglet.window.Window):
         if self.state == "menu":
             # ---- osu!-style main menu ----
             cxw, cyw = self.width // 2, self.height // 2
-            # subtle animated background ring (lane colors, faint)
             t = time.time()
+            S = self._shapes
+            S.reset()
             # background vignette
-            vign = pyglet.shapes.Rectangle(0, 0, self.width, self.height, color=(8, 8, 16))
-            vign.draw()
-            # faint converging-beat ring motif behind logo
+            S.rect(0, 0, self.width, self.height, (8, 8, 16), radius=0)
+            # faint converging-beat ring motif behind logo (drawn first, under all UI)
             for i, lane in enumerate(LANE_ORDER):
                 col = LANES[lane]['color']
                 cc = pyglet.shapes.Circle(cxw, cyw + 40, 150 - i*18, color=col)
                 cc.opacity = int(16 + 12 * (0.5 + 0.5 * math.sin(t * 1.4 + i)))
                 cc.draw()
+
+            # ---- shapes first (background + buttons) ----
+            # primary PLAY pill button (rounded)
+            play_w, play_h = 320, 72
+            px, py = cxw - play_w // 2, cyw - play_h // 2
+            play_sel = self.menu_index == 0
+            glow_op = int(60 + 30 * (0.5 + 0.5 * math.sin(t * 3.0)))
+            if play_sel:
+                S.rect(px - 12, py - 12, play_w + 24, play_h + 24, (100, 255, 160), radius=16, opacity=glow_op)
+            S.rect(px, py, play_w, play_h, (70, 90, 130) if play_sel else (34, 42, 64), radius=12)
+            S.rect(px, py, 10, play_h, (100, 255, 160), radius=5)
+            # secondary buttons: OPEN FILE / SETTINGS / QUIT (rounded)
+            for idx in (1, 2, 3):
+                wy = cyw - 130 - (idx - 1) * 46
+                selected = idx == self.menu_index
+                w = 240
+                S.rect(cxw - w // 2, wy - 18, w, 36, (46, 56, 84) if selected else (24, 28, 44), radius=10)
+                if selected:
+                    S.rect(cxw - w // 2, wy - 18, 6, 36, (120, 180, 255), radius=3)
+            # all shapes drawn now, UNDER the text
+            S.draw()
+
+            # ---- text on top (shapes already drawn) ----
             # logo
             self._menu_title_lbl.x = cxw
             self._menu_title_lbl.y = cyw + 150
@@ -2778,20 +2845,7 @@ class RhythmGame(pyglet.window.Window):
             self._menu_songs_hint_lbl.x = cxw
             self._menu_songs_hint_lbl.y = cyw + 86
             self._menu_songs_hint_lbl.draw()
-
-            # primary PLAY pill button
-            play_w, play_h = 320, 72
-            px, py = cxw - play_w // 2, cyw - play_h // 2
-            play_sel = self.menu_index == 0
-            glow = pyglet.shapes.Rectangle(px - 12, py - 12, play_w + 24, play_h + 24, color=(100, 255, 160))
-            glow.opacity = int(60 + 30 * (0.5 + 0.5 * math.sin(t * 3.0)))
-            if play_sel:
-                glow.draw()
-            bg = pyglet.shapes.Rectangle(px, py, play_w, play_h, color=(70, 90, 130) if play_sel else (34, 42, 64))
-            bg.draw()
-            # accent bar
-            accent = pyglet.shapes.Rectangle(px, py, 8, play_h, color=(100, 255, 160))
-            accent.draw()
+            # PLAY label (on the play pill)
             play_lbl = self._menu_option_lbls[0]
             play_lbl.text = "PLAY"
             play_lbl.x = cxw
@@ -2799,18 +2853,11 @@ class RhythmGame(pyglet.window.Window):
             play_lbl.font_size = 30
             play_lbl.color = (255, 255, 255, 255) if play_sel else (200, 215, 245, 255)
             play_lbl.draw()
-
-            # secondary buttons: OPEN FILE / SETTINGS / QUIT
+            # secondary button labels
             for idx in (1, 2, 3):
                 opt = self.menu_options[idx]
                 wy = cyw - 130 - (idx - 1) * 46
                 selected = idx == self.menu_index
-                w = 240
-                wbg = pyglet.shapes.Rectangle(cxw - w // 2, wy - 18, w, 36, color=(46, 56, 84) if selected else (24, 28, 44))
-                wbg.draw()
-                if selected:
-                    wacc = pyglet.shapes.Rectangle(cxw - w // 2, wy - 18, 5, 36, color=(120, 180, 255))
-                    wacc.draw()
                 wlbl = self._menu_option_lbls[idx]
                 wlbl.text = opt
                 wlbl.x = cxw
@@ -2818,7 +2865,6 @@ class RhythmGame(pyglet.window.Window):
                 wlbl.font_size = 15
                 wlbl.color = (255, 255, 140, 255) if selected else (180, 190, 220, 255)
                 wlbl.draw()
-
             # footer
             self._menu_footer_lbl.x = cxw
             self._menu_footer_lbl.y = 70
@@ -2840,8 +2886,9 @@ class RhythmGame(pyglet.window.Window):
         if self.state == "settings":
             # ---- settings screen (osu!-style) ----
             scx, scy = self.width // 2, self.height // 2
-            bg = pyglet.shapes.Rectangle(0, 0, self.width, self.height, color=(8, 8, 16))
-            bg.draw()
+            S = self._shapes
+            S.reset()
+            S.rect(0, 0, self.width, self.height, (8, 8, 16), radius=0)
             # faint accent ring motif
             t = time.time()
             for i, lane in enumerate(LANE_ORDER):
@@ -2849,19 +2896,25 @@ class RhythmGame(pyglet.window.Window):
                 cc = pyglet.shapes.Circle(scx, scy + 60, 170 - i * 22, color=col)
                 cc.opacity = int(14 + 10 * (0.5 + 0.5 * math.sin(t * 1.4 + i)))
                 cc.draw()
-            self._draw_label("SETTINGS", x=scx, y=scy + 190, size=34, color=(255, 255, 255, 255), anchor_x='center', anchor_y='center', weight='bold')
-
-            # settings card
+            # settings card (rounded)
             card_w, card_h = 560, 120
-            card = pyglet.shapes.Rectangle(scx - card_w // 2, scy - card_h // 2 - 20, card_w, card_h, color=(20, 24, 38))
-            card.draw()
-            border = pyglet.shapes.Rectangle(scx - card_w // 2, scy - card_h // 2 - 20, card_w, 3, color=(120, 180, 255))
-            border.draw()
-
+            S.rect(scx - card_w // 2, scy - card_h // 2 - 20, card_w, card_h, (20, 24, 38), radius=16)
             # rows
             nrows = len(self.settings_rows)
             row_h = 56
             start_y = scy + 20
+            for i, (keyname, label) in enumerate(self.settings_rows):
+                ry = start_y - i * (row_h + 8)
+                selected = i == self.settings_index
+                S.rect(scx - card_w // 2 + 24, ry - row_h // 2, card_w - 48, row_h,
+                       (44, 58, 92) if selected else (26, 30, 46), radius=12)
+                if selected:
+                    S.rect(scx - card_w // 2 + 24, ry - row_h // 2, 6, row_h, (100, 255, 160), radius=3)
+            # all shapes now, UNDER the text
+            S.draw()
+
+            # ---- text on top ----
+            self._draw_label("SETTINGS", x=scx, y=scy + 190, size=34, color=(255, 255, 255, 255), anchor_x='center', anchor_y='center', weight='bold')
             for i, (keyname, label) in enumerate(self.settings_rows):
                 ry = start_y - i * (row_h + 8)
                 selected = i == self.settings_index
@@ -2870,12 +2923,6 @@ class RhythmGame(pyglet.window.Window):
                     val = "ON" if self.is_fullscreen else "OFF"
                 else:
                     val = str(self.settings.get(keyname, ""))
-                row_bg = pyglet.shapes.Rectangle(scx - card_w // 2 + 24, ry - row_h // 2, card_w - 48, row_h,
-                                                 color=(44, 58, 92) if selected else (26, 30, 46))
-                row_bg.draw()
-                if selected:
-                    acc = pyglet.shapes.Rectangle(scx - card_w // 2 + 24, ry - row_h // 2, 6, row_h, color=(100, 255, 160))
-                    acc.draw()
                 self._draw_label(label, x=scx - card_w // 2 + 60, y=ry, size=20,
                                  color=(255, 255, 255, 255) if selected else (200, 210, 235, 255),
                                  anchor_x='left', anchor_y='center', weight='bold' if selected else 'normal')
@@ -2898,22 +2945,20 @@ class RhythmGame(pyglet.window.Window):
                     sel = self.song_files[si]
                 except Exception:
                     sel = None
+            S = self._shapes
+            S.reset()
             # 1) full-bleed dimmed preview of the selected song (live from preview player)
             if sel is not None:
                 shot = self._draw_song_preview(0, 0, WINDOW_W, WINDOW_H, str(sel))
                 if not shot:
-                    # themed placeholder gradient-ish (layered rects)
+                    # themed placeholder gradient-ish (layered rounded rects)
                     for i in range(5):
-                        pc = pyglet.shapes.Rectangle(0, 0, WINDOW_W, WINDOW_H, color=(10 + i*4, 12 + i*4, 26))
-                        pc.opacity = 255
-                        pc.draw()
+                        S.rect(0, 0, WINDOW_W, WINDOW_H, (10 + i*4, 12 + i*4, 26), radius=0)
             else:
-                bg = pyglet.shapes.Rectangle(0, 0, WINDOW_W, WINDOW_H, color=(10, 10, 18))
-                bg.draw()
+                S.rect(0, 0, WINDOW_W, WINDOW_H, (10, 10, 18), radius=0)
             # dim overlay for readability
-            dim = pyglet.shapes.Rectangle(0, 0, WINDOW_W, WINDOW_H, color=(6, 6, 16))
-            dim.opacity = 170
-            dim.draw()
+            S.rect(0, 0, WINDOW_W, WINDOW_H, (6, 6, 16), radius=0, opacity=170)
+            S.draw()
 
             if not self.song_files:
                 self._draw_label("No songs found.", x=cx, y=base_y + 40, size=18, color=(255, 220, 120, 255), anchor_x='center', anchor_y='center', weight='bold')
@@ -2927,7 +2972,6 @@ class RhythmGame(pyglet.window.Window):
             diff_desc = {k: DIFFICULTY_PROFILES[k][6] for k in DIFFICULTY_ORDER}
             name = sel.name
             disp = name if len(name) <= 30 else name[:27] + "..."
-            self._draw_label(disp, x=90, y=WINDOW_H - 108, size=30, color=(255, 255, 255, 255), anchor_x='left', anchor_y='center', weight='bold')
             # subtitle: size / ext / cached count
             sub_parts = []
             try:
@@ -2942,39 +2986,23 @@ class RhythmGame(pyglet.window.Window):
             if meta:
                 cached = sum(1 for v in meta.values() if v)
                 sub_parts.append(f"{cached}/3 beatmaps")
-            self._draw_label("  •  ".join(sub_parts), x=90, y=WINDOW_H - 142, size=11, color=(180, 195, 220, 255), anchor_x='left', anchor_y='center', font_name='Consolas')
 
-            # difficulty buttons
+            # difficulty buttons (rounded) - shapes first
             btn_w, btn_h = 320, 56
             bys = [500, 500 - 76, 500 - 152]
             for idx, opt in enumerate(self.difficulty_options):
                 by = bys[idx]
                 selected_d = idx == self.difficulty_index
                 if selected_d:
-                    bcol = (acc_r, acc_g, acc_b) if (acc_r+acc_g+acc_b) < 420 else (acc_r//2, acc_g//2, acc_b//2)
                     bcol = (min(255,acc_r), min(255,acc_g), min(255,acc_b))
                 else:
                     bcol = (26, 32, 52)
-                btn = pyglet.shapes.Rectangle(90, by - btn_h//2, btn_w, btn_h, color=bcol)
-                btn.draw()
+                S.rect(90, by - btn_h//2, btn_w, btn_h, bcol, radius=14)
                 if selected_d:
                     # accent left edge + chevron for the active difficulty
-                    acc_bar = pyglet.shapes.Rectangle(90, by - btn_h//2, 8, btn_h, color=(255, 255, 255))
-                    acc_bar.draw()
+                    S.rect(90, by - btn_h//2, 8, btn_h, (255, 255, 255), radius=4)
                     tri = pyglet.shapes.Triangle(90 + btn_w + 2, by + 10, 90 + btn_w + 2, by - 10, 90 + btn_w + 16, by, color=bcol)
                     tri.draw()
-                tcol = (255, 255, 255, 255) if selected_d else (205, 212, 232, 255)
-                self._draw_label(opt, x=118, y=by + 6, size=18, color=tcol, anchor_x='left', anchor_y='center', weight='bold')
-                # difficulty description + rating
-                m = meta.get(opt.lower())
-                if m and m[0]:
-                    r, bts = m
-                    detail = f"d{r}  •  {bts} beats"
-                else:
-                    detail = diff_desc.get(opt.lower(), "")
-                self._draw_label(detail, x=118, y=by - 16, size=10, color=(235, 235, 255, 255) if selected_d else (150, 162, 190, 255), anchor_x='left', anchor_y='center', font_name='Consolas')
-            # hint under difficulty buttons
-            self._draw_label("1 / 2 / 3  or  LEFT / RIGHT : difficulty      •      ENTER : play this song", x=90, y=306, size=10, color=(150, 165, 195, 255), anchor_x='left', anchor_y='center', font_name='Consolas')
 
             # ---- right: vertical carousel of song cards (selected pulled out) ----
             play_pull = self.sc_selected_pull  # 0..1
@@ -2982,10 +3010,10 @@ class RhythmGame(pyglet.window.Window):
             i0 = max(0, self.song_index - vis_half)
             i1 = min(len(self.song_files) - 1, self.song_index + vis_half)
             cw, ch = 330, 92
+            carousel = []  # (p, cy, x0, y0, w, h, selected, alpha)
             for i in range(i0, i1 + 1):
                 p = self.song_files[i]
                 rel = i - self.song_index
-                # index 0 at top; higher index lower on screen
                 cy = base_y + self.sc_scroll - i * 112.0
                 selected = i == self.song_index
                 if selected:
@@ -3001,22 +3029,43 @@ class RhythmGame(pyglet.window.Window):
                 h = ch * scale
                 x0 = WINDOW_W - w - 46 + xoff
                 y0 = cy - h / 2
-                # card panel (selected tinted with the song's accent color)
+                # card panel (selected tinted with the song's accent color, rounded)
                 if selected:
                     col_bg = (max(28, acc_r//3), max(28, acc_g//3), max(28, acc_b//3))
                 else:
                     col_bg = (24, 30, 50)
-                card = pyglet.shapes.Rectangle(x0, y0, w, h, color=col_bg)
-                card.opacity = alpha
-                card.draw()
+                S.rect(x0, y0, w, h, col_bg, radius=16, opacity=alpha)
                 if selected:
-                    # accent side bar (uses the song's color)
-                    bord = pyglet.shapes.Rectangle(x0, y0, 7, h, color=(acc_r, acc_g, acc_b))
-                    bord.draw()
-                    ring = pyglet.shapes.Rectangle(x0, y0, w, 3, color=(acc_r, acc_g, acc_b))
-                    ring.draw()
-                    ring2 = pyglet.shapes.Rectangle(x0, y0 + h - 3, w, 3, color=(acc_r, acc_g, acc_b))
-                    ring2.draw()
+                    # rounded accent edge bar using the song's color
+                    S.rect(x0 + 6, y0 + 6, 7, h - 12, (acc_r, acc_g, acc_b), radius=4, opacity=alpha)
+                    S.rect(x0 + 6, y0 + 6, w - 12, 3, (acc_r, acc_g, acc_b), radius=2, opacity=alpha)
+                    S.rect(x0 + 6, y0 + h - 9, w - 12, 3, (acc_r, acc_g, acc_b), radius=2, opacity=alpha)
+                carousel.append((p, cy, x0, y0, w, h, selected, alpha))
+            # all shapes (difficulty buttons + carousel cards) now, UNDER text
+            S.draw()
+
+            # ---- text on top ----
+            # left: song name
+            self._draw_label(disp, x=90, y=WINDOW_H - 108, size=30, color=(255, 255, 255, 255), anchor_x='left', anchor_y='center', weight='bold')
+            self._draw_label("  •  ".join(sub_parts), x=90, y=WINDOW_H - 142, size=11, color=(180, 195, 220, 255), anchor_x='left', anchor_y='center', font_name='Consolas')
+            # difficulty button labels
+            for idx, opt in enumerate(self.difficulty_options):
+                by = bys[idx]
+                selected_d = idx == self.difficulty_index
+                tcol = (255, 255, 255, 255) if selected_d else (205, 212, 232, 255)
+                self._draw_label(opt, x=118, y=by + 6, size=18, color=tcol, anchor_x='left', anchor_y='center', weight='bold')
+                # difficulty description + rating
+                m = meta.get(opt.lower())
+                if m and m[0]:
+                    r, bts = m
+                    detail = f"d{r}  •  {bts} beats"
+                else:
+                    detail = diff_desc.get(opt.lower(), "")
+                self._draw_label(detail, x=118, y=by - 16, size=10, color=(235, 235, 255, 255) if selected_d else (150, 162, 190, 255), anchor_x='left', anchor_y='center', font_name='Consolas')
+            # hint under difficulty buttons
+            self._draw_label("1 / 2 / 3  or  LEFT / RIGHT : difficulty      •      ENTER : play this song", x=90, y=306, size=10, color=(150, 165, 195, 255), anchor_x='left', anchor_y='center', font_name='Consolas')
+            # carousel card labels
+            for (p, cy, x0, y0, w, h, selected, alpha) in carousel:
                 nm = p.name
                 if len(nm) > 27:
                     nm = nm[:24] + "..."
@@ -3041,25 +3090,32 @@ class RhythmGame(pyglet.window.Window):
 
 
         if self.state == "difficulty_select":
-            self._draw_label("CHOOSE DIFFICULTY", x=WINDOW_W//2, y=WINDOW_H - 70, size=26, color=(255,255,255,255), anchor_x='center', anchor_y='center', weight='bold')
+            S = self._shapes
+            S.reset()
+            S.rect(0, 0, WINDOW_W, WINDOW_H, (10, 10, 18), radius=0)
             song_name = Path(self.pending_song_path).name if self.pending_song_path else "Unknown"
             if len(song_name) > 55:
                 song_name = song_name[:52] + "..."
-            self._draw_label(song_name, x=WINDOW_W//2, y=WINDOW_H - 105, size=11, color=(140,200,255,255), anchor_x='center', anchor_y='center', font_name='Consolas')
-            # panel - tall enough for 3 difficulty rows
+            # panel - tall enough for 3 difficulty rows (rounded)
             panel_x, panel_y, panel_w, panel_h = 320, 200, 640, 300
-            panel = pyglet.shapes.Rectangle(panel_x, panel_y, panel_w, panel_h, color=(18,18,30))
-            panel.draw()
-            # options (EASY / MEDIUM / HARD)
+            S.rect(panel_x, panel_y, panel_w, panel_h, (18,18,30), radius=18)
+            # options (EASY / MEDIUM / HARD) - shapes first
+            rows = []
             for idx, opt in enumerate(self.difficulty_options):
                 y = 470 - idx*100
                 selected = idx == self.difficulty_index
-                # box (70 tall)
-                box = pyglet.shapes.Rectangle(panel_x+30, y-35, panel_w-60, 70, color=(55,55,90) if selected else (28,28,42))
-                box.draw()
+                # box (70 tall, rounded)
+                S.rect(panel_x+30, y-35, panel_w-60, 70, (55,55,90) if selected else (28,28,42), radius=14)
                 if selected:
-                    accent = pyglet.shapes.Rectangle(panel_x+30, y-35, 6, 70, color=(100,255,160))
-                    accent.draw()
+                    S.rect(panel_x+30, y-35, 6, 70, (100,255,160), radius=3)
+                rows.append((idx, opt, y, selected))
+            # all shapes now, UNDER the text
+            S.draw()
+
+            # ---- text on top ----
+            self._draw_label("CHOOSE DIFFICULTY", x=WINDOW_W//2, y=WINDOW_H - 70, size=26, color=(255,255,255,255), anchor_x='center', anchor_y='center', weight='bold')
+            self._draw_label(song_name, x=WINDOW_W//2, y=WINDOW_H - 105, size=11, color=(140,200,255,255), anchor_x='center', anchor_y='center', font_name='Consolas')
+            for (idx, opt, y, selected) in rows:
                 # label
                 col = (255,255,140,255) if selected else (220,220,240,255)
                 self._draw_label(opt, x=panel_x+60, y=y+12, size=18, color=(*col[:3],255), anchor_x='left', anchor_y='center', weight='bold')
