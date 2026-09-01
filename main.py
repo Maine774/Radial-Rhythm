@@ -26,6 +26,7 @@ import wave
 import threading
 import hashlib
 import ctypes
+import random
 from pathlib import Path
 
 # Find bundled FFmpeg shared DLLs so pyglet can decode mp4 natively.
@@ -278,6 +279,60 @@ def save_cached_beatmap(media_path, beatmap, duration, tempo, sensitivity=1.0, d
         print(f"[cache] saved {cp} ({len(beatmap)} beats)")
     except Exception as e:
         print(f"[cache] save failed {e}")
+
+# ------------------------------------------------------------
+# Per-song history (stored in the beatmap cache JSON)
+# ------------------------------------------------------------
+HISTORY_MAX = 10
+
+def load_history(media_path, difficulty="easy"):
+    cp = get_cache_path(media_path, difficulty)
+    if not cp.exists():
+        return []
+    try:
+        with open(cp, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        return data.get('history', [])
+    except Exception:
+        return []
+
+def add_history_entry(media_path, difficulty, entry):
+    try:
+        cp = get_cache_path(media_path, difficulty)
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        data = {}
+        if cp.exists():
+            with open(cp, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        hist = list(data.get('history', []))
+        hist.append(entry)
+        data['history'] = hist[-HISTORY_MAX:]
+        with open(cp, 'w', encoding='utf-8') as f:
+            json.dump(data, f)
+    except Exception as e:
+        print(f"[cache] history save failed {e}")
+
+def best_grade_from_history(hist):
+    order = {'S':5, 'A':4, 'B':3, 'C':2, 'D':1}
+    best = None
+    for e in hist:
+        g = (e.get('grade','') or '').strip().upper()
+        g = g[-1] if g and g[-1] in 'SABCD' else 'D'
+        if best is None or order.get(g,0) > order.get(best,0):
+            best = g
+    return best
+
+def best_max_fc_from_history(hist):
+    best = 0
+    for e in hist:
+        best = max(best, int(e.get('max_fc', 0)))
+    return best or None
+
+def best_score_from_history(hist):
+    best = 0
+    for e in hist:
+        best = max(best, int(e.get('score', 0)))
+    return best or None
 
 # ------------------------------------------------------------
 # Audio analysis via ffmpeg + numpy
@@ -1170,6 +1225,18 @@ class RhythmGame(pyglet.window.Window):
         self.hit_pulse = 0.0
         self.lane_flash = {lane: 0.0 for lane in LANE_ORDER}
 
+        # judgement bursts (float-up animations)
+        self._judge_bursts = []
+
+        # screen shake & centre target FX
+        self._shake_t = 0.0
+        self._shake_dur = 0.0
+        self._shake_mag = 0.0
+        self._fx_rings = []
+
+        # result history flag
+        self._result_is_new_best = False
+
         # preload demo so menu can show beat count
         self.demo_beatmap = generate_demo_pattern(bpm=128, bars=16)
         self.beatmap = self.demo_beatmap
@@ -1266,6 +1333,7 @@ class RhythmGame(pyglet.window.Window):
         self._hud_time_lbl = pyglet.text.Label("", x=WINDOW_W-12, y=WINDOW_H-18, font_name='Consolas', font_size=10, color=(180,220,255,255), anchor_x='right', anchor_y='top')
         self._hud_mode_lbl = pyglet.text.Label("", x=WINDOW_W-12, y=WINDOW_H-32, font_name='Consolas', font_size=10, color=(150,170,200,255), anchor_x='right', anchor_y='top')
         self._hud_feedback_lbl = pyglet.text.Label("", x=CENTER[0], y=CENTER[1]+110, font_name='Arial', font_size=24, weight='bold', color=(255,255,255,255), anchor_x='center', anchor_y='center')
+        self._hud_burst_lbl = pyglet.text.Label("", x=CENTER[0], y=CENTER[1]+70, font_name='Arial', font_size=26, weight='bold', color=(255,255,255,255), anchor_x='center', anchor_y='center')
         self._hud_instr_lbl = pyglet.text.Label("", x=WINDOW_W//2, y=18, font_name='Consolas', font_size=9, color=(130,130,160,255), anchor_x='center', anchor_y='center')
         # HUD shapes (reuse)
         self._hud_top_bar = pyglet.shapes.Rectangle(0, WINDOW_H-46, WINDOW_W, 46, color=(18,18,30))
@@ -1423,6 +1491,13 @@ class RhythmGame(pyglet.window.Window):
             self.settings[keyname] = cur
         self._save_config()
         self._apply_settings_to_playback()
+        # click-test tone: give audible feedback when tweaking volumes
+        if keyname == "fx_volume":
+            try: self._play_clickfx()
+            except: pass
+        elif keyname == "music_volume":
+            try: self._play_test_tone()
+            except: pass
 
     def _apply_settings_to_playback(self):
         # keep any live players in sync with the current volume settings
@@ -1730,6 +1805,11 @@ class RhythmGame(pyglet.window.Window):
         self.hit_pulse = 0
         for k in self.lane_flash:
             self.lane_flash[k] = 0
+        self._judge_bursts = []
+        self._fx_rings = []
+        self._shake_t = 0.0
+        self._shake_dur = 0.0
+        self._result_is_new_best = False
 
     def start_demo(self):
         self.load_demo()
@@ -2012,6 +2092,9 @@ class RhythmGame(pyglet.window.Window):
                 break
 
     def update(self, dt):
+        # decay fx even outside playing
+        try: self._tick_fx(dt)
+        except: pass
         if self.state not in ("playing",):
             for k in self.lane_flash:
                 if self.lane_flash[k] > 0:
@@ -2079,6 +2162,7 @@ class RhythmGame(pyglet.window.Window):
                 self.hits['miss'] += 1
                 self.combo = 0
                 self._break_fc()
+                self._on_miss()
                 # don't overwrite a recent hit's feedback (e.g., PERFECT) immediately
                 if time.time() - self.feedback_time > 0.35 or self.feedback_text == "MISS":
                     self.feedback_text = "MISS"
@@ -2112,11 +2196,59 @@ class RhythmGame(pyglet.window.Window):
             if self.media_player:
                 try: self.media_player.pause()
                 except: pass
+            self._record_result()
             self.state = "results"
             self.feedback_text = f"FINISH! Score {self.score}  Max combo x{self.max_combo}"
             self.feedback_color = (255, 255, 100, 255)
             self.feedback_time = time.time()
             self.set_caption("Radial Rhythm - Results")
+
+    # ---- audio helpers (shared) ----
+    def _play_source_tracked(self, src, vol):
+        if src is None:
+            return
+        try:
+            pl = pyglet.media.Player()
+            pl.queue(src)
+            pl.volume = max(0.0, min(1.0, float(vol)))
+            pl.play()
+            if not hasattr(self, '_clickfx_players'):
+                self._clickfx_players = []
+            self._clickfx_players.append(pl)
+            self._clickfx_players = [p for p in self._clickfx_players if p.playing]
+        except Exception:
+            pass
+
+    def _generate_test_tone(self, path, freq=523.25, dur=0.18, volume=0.6):
+        sr = 44100
+        n = int(sr * dur)
+        import struct as _struct
+        frames = bytearray()
+        for i in range(n):
+            t = i / sr
+            env = min(1.0, i / (sr * 0.01)) * min(1.0, (n - i) / (sr * 0.05))
+            val = int(32767 * volume * env * math.sin(2 * math.pi * freq * t))
+            frames += _struct.pack('<h', val)
+        with wave.open(str(path), 'wb') as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(sr)
+            wf.writeframes(bytes(frames))
+
+    def _ensure_test_tone(self):
+        if getattr(self, '_test_tone_src', None) is None:
+            p = Path(__file__).resolve().parent / "SFX" / "_test_tone.wav"
+            try:
+                if not p.exists():
+                    self._generate_test_tone(p)
+                self._test_tone_src = pyglet.media.load(str(p), streaming=False)
+            except Exception:
+                self._test_tone_src = None
+        return self._test_tone_src
+
+    def _play_test_tone(self):
+        src = self._ensure_test_tone()
+        self._play_source_tracked(src, self.settings.get("music_volume", 0.9))
 
     def _play_clickfx(self):
         # play the keypress SFX - fires on EVERY lane key press during a song
@@ -2126,19 +2258,7 @@ class RhythmGame(pyglet.window.Window):
                 if not p.exists():
                     return
                 self._clickfx_src = pyglet.media.load(str(p), streaming=False)
-            src = self._clickfx_src
-            if src is None:
-                return
-            pl = pyglet.media.Player()
-            pl.queue(src)
-            pl.volume = max(0.0, min(1.0, float(self.settings.get("fx_volume", 0.7))))
-            pl.play()
-            # keep reference so it doesn't get GC'd before playing
-            if not hasattr(self, '_clickfx_players'):
-                self._clickfx_players = []
-            self._clickfx_players.append(pl)
-            # cleanup finished players
-            self._clickfx_players = [p for p in self._clickfx_players if p.playing]
+            self._play_source_tracked(self._clickfx_src, self.settings.get("fx_volume", 0.7))
         except Exception:
             pass
 
@@ -2161,6 +2281,7 @@ class RhythmGame(pyglet.window.Window):
         if best is None:
             self.combo = max(0, self.combo - 1)
             self._break_fc()
+            self._on_miss()
             self.feedback_text = "MISS"
             self.feedback_color = (255, 120, 80, 255)
             self.feedback_time = time.time()
@@ -2171,24 +2292,30 @@ class RhythmGame(pyglet.window.Window):
             self.hits['perfect'] += 1
             self.fc += 1
             self.max_fc = max(self.max_fc, self.fc)
+            self._spawn_judge("PERFECT", (255, 240, 80))
+            if self.fc > 0 and self.fc % 10 == 0:
+                self._fc_milestone(self.fc)
             self.feedback_text = "PERFECT!"
             self.feedback_color = (255, 240, 80, 255)
         elif best_delta <= HIT_WINDOW_GOOD:
             pts = 200
             self.hits['good'] += 1
             self._break_fc()
+            self._spawn_judge("GOOD", (100, 255, 150))
             self.feedback_text = "GOOD"
             self.feedback_color = (100, 255, 150, 255)
         elif best_delta <= HIT_WINDOW_OK:
             pts = 100
             self.hits['meh'] += 1
             self._break_fc()
+            self._spawn_judge("MEH", (100, 200, 255))
             self.feedback_text = "MEH"
             self.feedback_color = (100, 200, 255, 255)
         else:
             # too far - don't double-count miss (update will count timeout)
             self.combo = max(0, self.combo - 1)
             self._break_fc()
+            self._on_miss()
             self.feedback_text = "MISS"
             self.feedback_color = (255, 80, 80, 255)
             self.feedback_time = time.time()
@@ -2231,6 +2358,137 @@ class RhythmGame(pyglet.window.Window):
         if pct >= 50.0:
             return "C", pct
         return "D", pct
+
+    # ---- judgement bursts + shake/fx + history ----
+    def _spawn_judge(self, text, color):
+        try:
+            self._judge_bursts.append({'text': text, 'color': tuple(color[:3]), 't0': time.time()})
+            if len(self._judge_bursts) > 12:
+                self._judge_bursts.pop(0)
+        except Exception:
+            pass
+
+    def _draw_judge_bursts(self):
+        if not getattr(self, '_judge_bursts', None):
+            return
+        keep = []
+        tnow = time.time()
+        for jb in self._judge_bursts:
+            age = tnow - jb['t0']
+            dur = 0.9
+            if age >= dur:
+                continue
+            t = age / dur
+            alpha = int(255 * (1 - t))
+            rise = int(t * 54)
+            pop = 1.0 + math.sin(min(1.0, t * 3.0) * math.pi) * 0.14
+            fsize = int(28 * pop) if jb['text'] == 'PERFECT' else int(24 * pop)
+            if 'FC' in jb['text']:
+                fsize = int(18 * pop)
+            shx = shy = 0
+            try:
+                if getattr(self, '_shake_t', 0) > 0:
+                    shx, shy = self._shake_offset()
+                    shx *= 0.3; shy *= 0.3
+            except: pass
+            self._hud_burst_lbl.text = jb['text']
+            self._hud_burst_lbl.font_size = max(12, fsize)
+            self._hud_burst_lbl.x = self.width // 2 + shx
+            self._hud_burst_lbl.y = self.height // 2 + 76 + rise + shy
+            try:
+                self._hud_burst_lbl.color = (*jb['color'], min(255, max(0, alpha)))
+            except Exception:
+                self._hud_burst_lbl.color = (255, 255, 255, min(255, max(0, alpha)))
+            self._hud_burst_lbl.draw()
+            keep.append(jb)
+        self._judge_bursts = keep
+
+    def _trigger_shake(self, mag, dur):
+        self._shake_mag = float(mag)
+        self._shake_t = float(dur)
+        self._shake_dur = float(dur) if dur else 0.001
+
+    def _shake_offset(self):
+        if getattr(self, '_shake_t', 0) <= 0:
+            return 0.0, 0.0
+        k = self._shake_t / self._shake_dur if getattr(self, '_shake_dur', 0) else 0
+        m = self._shake_mag * k
+        return random.uniform(-m, m), random.uniform(-m, m)
+
+    def _tick_fx(self, dt):
+        if getattr(self, '_shake_t', 0) > 0:
+            self._shake_t = max(0.0, self._shake_t - dt)
+
+    def _spawn_ring_fx(self, color, max_r=90):
+        try:
+            self._fx_rings.append({'t0': time.time(), 'dur': 0.48, 'max_r': int(max_r), 'color': tuple(color[:3])})
+        except Exception:
+            pass
+
+    def _draw_fx_rings(self):
+        if not getattr(self, '_fx_rings', None):
+            return
+        keep = []
+        tnow = time.time()
+        cx, cy = self.width // 2, self.height // 2
+        # shake the rings slightly with the playfield
+        try:
+            shx, shy = self._shake_offset()
+            cx += shx * 0.5; cy += shy * 0.5
+        except: pass
+        for r in self._fx_rings:
+            age = tnow - r['t0']
+            if age >= r['dur']:
+                continue
+            t = age / r['dur']
+            radius = int(12 + t * r['max_r'])
+            alpha = int(190 * (1 - t))
+            arc = pyglet.shapes.Arc(cx, cy, radius, segments=48, thickness=3.0, color=r['color'])
+            try:
+                arc.opacity = max(0, min(255, alpha))
+            except Exception:
+                pass
+            arc.draw()
+            keep.append(r)
+        self._fx_rings = keep
+
+    def _on_miss(self):
+        self._spawn_judge("MISS", (255, 80, 80))
+        self._spawn_ring_fx((255, 80, 80), 88)
+        if getattr(self, '_shake_t', 0) <= 0.08:
+            self._trigger_shake(7.0, 0.26)
+
+    def _fc_milestone(self, fc):
+        self._spawn_ring_fx((120, 220, 255), 108)
+        self._trigger_shake(3.2, 0.20)
+        self._spawn_judge(f"FC x{fc}", (140, 230, 255))
+
+    def _record_result(self):
+        self._result_is_new_best = False
+        if not getattr(self, 'media_path', None):
+            return
+        try:
+            import os as _os
+            if not _os.path.exists(self.media_path):
+                return
+            # only record finished media plays
+            if not getattr(self, 'is_media_mode', False):
+                return
+        except Exception:
+            return
+        try:
+            gr, pct = self.grade()
+            total = sum(self.hits.values()) or 1
+            acc = (self.hits['perfect']*1.0 + self.hits['good']*0.85 + self.hits['meh']*0.6) / total * 100
+            entry = {'date': time.strftime('%Y-%m-%d %H:%M'), 'grade': gr, 'pct': round(pct,1),
+                     'score': int(self.score), 'max_fc': int(self.max_fc), 'max_combo': int(self.max_combo),
+                     'acc': round(acc,1), 'diff': getattr(self, 'difficulty', 'easy')}
+            old_best = best_grade_from_history(load_history(self.media_path, self.difficulty))
+            add_history_entry(self.media_path, self.difficulty, entry)
+            cur_best = best_grade_from_history(load_history(self.media_path, self.difficulty))
+            self._result_is_new_best = (cur_best is not None and cur_best != old_best)
+        except Exception:
+            pass
 
     # --------------------------------------------------------
     # Input
@@ -2647,6 +2905,20 @@ class RhythmGame(pyglet.window.Window):
         self._center_shadow2.visible = False
         self._center_inner.visible = False
         self._center_main.visible = True
+        # shake: move centre shapes to the (possibly shaken) cx,cy
+        try:
+            self._center_outer.x = cx; self._center_outer.y = cy
+            self._center_main.x = cx; self._center_main.y = cy
+            self._center_dot.x = cx; self._center_dot.y = cy
+            for _d in getattr(self, '_center_lane_dots', {}).values():
+                _d.x = cx; _d.y = cy
+            for _g in getattr(self, '_center_lane_glows', {}).values():
+                _g.x = cx; _g.y = cy
+            self._center_shadow1.x = cx; self._center_shadow1.y = cy
+            self._center_shadow2.x = cx; self._center_shadow2.y = cy
+            self._center_inner.x = cx; self._center_inner.y = cy
+        except Exception:
+            pass
         if abs(pulse - self._center_last_pulse) > 0.005:
             pulse_r = TARGET_RADIUS + pulse * 22
             self._center_outer.radius = int(pulse_r)
@@ -2716,6 +2988,13 @@ class RhythmGame(pyglet.window.Window):
 
     def _draw_beats(self, song_t):
         cx, cy = CENTER
+        # shake offset for the playfield
+        shx = shy = 0
+        try:
+            if getattr(self, '_shake_t', 0) > 0:
+                shx, shy = self._shake_offset()
+                cx += shx; cy += shy
+        except: pass
         # lane/beat transparency (0..1) scales note opacity
         la = max(0.2, min(1.0, float(self.settings.get("lane_alpha", 0.85))))
         self._lane_alpha_mult = la
@@ -2885,7 +3164,9 @@ class RhythmGame(pyglet.window.Window):
                 self._hud_mode_lbl.text = mode
             self._hud_mode_lbl.x = self.width - 12
             self._hud_mode_lbl.draw()
-        if self.feedback_text and (time.time() - self.feedback_time) < 1.6:
+        # top feedback (skip judgement texts - they use float-up bursts)
+        _judge_set = {"PERFECT!", "GOOD", "MEH", "MISS"}
+        if self.feedback_text and (time.time() - self.feedback_time) < 1.6 and self.feedback_text not in _judge_set:
             age = time.time() - self.feedback_time
             alpha = int(255 * (1 - age/1.6))
             alpha = max(0, min(255, alpha))
@@ -2898,6 +3179,10 @@ class RhythmGame(pyglet.window.Window):
             self._hud_feedback_lbl.y = cy+110 + int((scale-1)*20)
             self._hud_feedback_lbl.color = (*self.feedback_color[:3], alpha)
             self._hud_feedback_lbl.draw()
+        # float-up judgement bursts (PERFECT/GOOD/MEH/MISS/FC)
+        if self.state in ("playing", "paused"):
+            try: self._draw_judge_bursts()
+            except: pass
 
     # --------------------------------------------------------
     # Main draw dispatcher
@@ -3015,21 +3300,40 @@ class RhythmGame(pyglet.window.Window):
                 self._draw_video_background()
             # game bg - update batched shapes
             pulse = self.hit_pulse
-            self._draw_center_target(cx, cy, pulse)
+            # use shaken center if a shake is active
+            scx, scy = cx, cy
+            if self.state == "playing":
+                try:
+                    shx, shy = self._shake_offset()
+                    scx += shx; scy += shy
+                except: pass
+            self._draw_center_target(scx, scy, pulse)
             if self.state == "playing":
                 song_t = self.get_song_time()
+                # _draw_beats adds its own shake offset internally
                 self._draw_beats(song_t)
-            elif self.state == "paused":
-                # still show beats frozen at pause time? skip (keep last positions)
-                pass
             # draw all batched game shapes in one call (60fps)
             try:
                 self.game_batch.draw()
             except:
                 pass
-            # lane outer labels (persistent, on top of batch)
+            # expanding FX rings on the centre target (FC / miss) - shaken
+            try: self._draw_fx_rings()
+            except: pass
+            # lane outer labels (persistent, on top of batch) - shaken slightly
+            try:
+                shx2, shy2 = (0,0)
+                if self.state == "playing":
+                    shx2, shy2 = self._shake_offset()
+            except: shx2 = shy2 = 0
             for lbl in self._lane_text_labels.values():
-                lbl.draw()
+                if shx2 or shy2:
+                    ox, oy = lbl.x, lbl.y
+                    lbl.x += shx2; lbl.y += shy2
+                    lbl.draw()
+                    lbl.x, lbl.y = ox, oy
+                else:
+                    lbl.draw()
             # overlay for paused / results
             if self.state == "paused":
                 S = self._shapes
@@ -3057,13 +3361,27 @@ class RhythmGame(pyglet.window.Window):
                 self._draw_label(f"Grade {gr}", x=WINDOW_W//2, y=card_y+card_h-78, size=26, color=(*gr_col,255), anchor_x='center', anchor_y='center', weight='bold')
                 self._draw_label(f"Score  {self.score:06d}    {pct:.0f}% of max", x=WINDOW_W//2, y=card_y+card_h-110, size=15, color=(255,255,255,255), anchor_x='center', anchor_y='center', weight='bold')
                 self._draw_label(f"Max Combo  x{self.max_combo}    Perfect Combo  x{self.max_fc}", x=WINDOW_W//2, y=card_y+card_h-136, size=12, color=(180,220,255,255), anchor_x='center', anchor_y='center', font_name='Consolas')
+                # best grade / FC from history
+                try:
+                    hist = load_history(self.media_path, self.difficulty) if getattr(self, 'media_path', None) else []
+                    bg = best_grade_from_history(hist)
+                    bf = best_max_fc_from_history(hist)
+                    nb = getattr(self, '_result_is_new_best', False)
+                    ht = "Best "
+                    ht += f"grade {bg}" if bg else "grade -"
+                    if bf: ht += f"   FC x{bf}"
+                    ht += f"   Plays: {len(hist)}"
+                    if nb: ht += "  NEW BEST!"
+                    hcol = (200,150,255,255) if nb else (150,170,200,255)
+                    self._draw_label(ht, x=WINDOW_W//2, y=card_y+card_h-158, size=10, color=hcol, anchor_x='center', anchor_y='center', font_name='Consolas')
+                except: pass
                 # hits breakdown
                 total = sum(self.hits.values()) or 1
                 acc = (self.hits['perfect']*1.0 + self.hits['good']*0.85 + self.hits['meh']*0.6) / total * 100
-                self._draw_label(f"PERFECT {self.hits['perfect']}   GOOD {self.hits['good']}   MEH {self.hits['meh']}   MISS {self.hits['miss']}", x=WINDOW_W//2, y=card_y+card_h-170, size=11, color=(220,220,240,255), anchor_x='center', anchor_y='center', font_name='Consolas')
-                self._draw_label(f"Accuracy  {acc:.1f}%", x=WINDOW_W//2, y=card_y+card_h-198, size=14, color=(120,255,150,255), anchor_x='center', anchor_y='center', weight='bold')
+                self._draw_label(f"PERFECT {self.hits['perfect']}   GOOD {self.hits['good']}   MEH {self.hits['meh']}   MISS {self.hits['miss']}", x=WINDOW_W//2, y=card_y+card_h-182, size=11, color=(220,220,240,255), anchor_x='center', anchor_y='center', font_name='Consolas')
+                self._draw_label(f"Accuracy  {acc:.1f}%", x=WINDOW_W//2, y=card_y+card_h-206, size=14, color=(120,255,150,255), anchor_x='center', anchor_y='center', weight='bold')
                 if self.media_path:
-                    self._draw_label(Path(self.media_path).name, x=WINDOW_W//2, y=card_y+card_h-224, size=9, color=(150,170,200,255), anchor_x='center', anchor_y='center', font_name='Consolas')
+                    self._draw_label(Path(self.media_path).name, x=WINDOW_W//2, y=card_y+card_h-230, size=9, color=(150,170,200,255), anchor_x='center', anchor_y='center', font_name='Consolas')
                 self._draw_label("ENTER / SPACE / ESC : back to menu    R : replay", x=WINDOW_W//2, y=card_y+30, size=10, color=(160,160,190,255), anchor_x='center', anchor_y='center', font_name='Consolas')
                 # still show HUD? not needed
                 return
@@ -3529,7 +3847,7 @@ class RhythmGame(pyglet.window.Window):
                     mk = rating_marker(density_to_rating(prof[3]))
                     mcol = (255,220,120,255) if selected else (170,170,200,255)
                     self._draw_label(f"~{mk}", x=panel_x+panel_w-40, y=y+12, size=15, color=(*mcol[:3],255), anchor_x='right', anchor_y='center', weight='bold')
-                # beats preview if cached (below desc)
+                # beats preview if cached (below desc) + best grade/FC from history
                 try:
                     p = self.pending_song_path
                     if p:
@@ -3538,7 +3856,16 @@ class RhythmGame(pyglet.window.Window):
                             import json as _js
                             d=_js.load(open(cp,encoding='utf-8'))
                             cr = d.get('rating', 1)
-                            self._draw_label(f"d{cr} • {len(d.get('beatmap',[]))} beats", x=panel_x+panel_w-40, y=y-16, size=9, color=(120,200,120,255), anchor_x='right', anchor_y='center', font_name='Consolas')
+                            nb = len(d.get('beatmap',[]))
+                            hist = d.get('history', [])
+                            g = best_grade_from_history(hist)
+                            f = best_max_fc_from_history(hist)
+                            tail = f"d{cr} \u2022 {nb} beats"
+                            if g:
+                                tail += f"  \u2022  best {g}"
+                                if f: tail += f" FC x{f}"
+                            hcol = (140,230,170,255) if g else (120,200,120,255)
+                            self._draw_label(tail, x=panel_x+panel_w-40, y=y-16, size=9, color=hcol, anchor_x='right', anchor_y='center', font_name='Consolas')
                 except:
                     pass
             self._draw_label("UP/DOWN choose • ENTER confirm • 1/2/3 quick • ESC back", x=WINDOW_W//2, y=panel_y+14, size=9, color=(120,140,170,255), anchor_x='center', anchor_y='center', font_name='Consolas')
