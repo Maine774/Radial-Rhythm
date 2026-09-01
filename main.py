@@ -1084,7 +1084,14 @@ class RhythmGame(pyglet.window.Window):
         self._fps_display.label.color = (120,120,130,180)
         self.is_fullscreen = False
         # ---- persisted settings ----
-        self.settings = {"fullscreen": False}
+        self.settings = {
+            "fullscreen": False,
+            "input_latency": 0.0,        # seconds added to note timing (positive = later)
+            "music_volume": 0.9,         # 0..1
+            "fx_volume": 0.7,            # 0..1 (reserved for future FX hitsounds/effects)
+            "video_brightness": 0.30,    # 0..1 (video/background dimming; higher = brighter video)
+            "lane_alpha": 0.85,          # 0..1 opacity of lanes, beats and target ring
+        }
         self._config_path = Path(__file__).resolve().parent / "config.json"
         self._load_config()
         if self.settings.get("fullscreen"):
@@ -1095,12 +1102,24 @@ class RhythmGame(pyglet.window.Window):
                 self.is_fullscreen = False
 
         # game state
-        self.state = "menu"  # menu / song_select / playing / paused / results
+        self.state = "menu"  # menu / song_select / playing / paused / results / keybinds
         self.menu_index = 0
         self.menu_options = ["PLAY", "OPEN FILE", "SETTINGS", "QUIT"]
         self.menu_pull = 0.0  # animated menu selection position
         self.settings_index = 0
-        self.settings_rows = [("fullscreen", "Fullscreen")]  # (setting key, label)
+        # each row: (settings_key, label, type) where type is toggle / range / submenu.
+        # "submenu" opens a dedicated screen (e.g. keybinds) instead of adjusting a value.
+        self.settings_rows = [
+            ("fullscreen",       "Fullscreen",         "toggle"),
+            ("input_latency",    "Input latency",      "range"),
+            ("music_volume",     "Music volume",       "range"),
+            ("fx_volume",        "FX volume",          "range"),
+            ("video_brightness", "Video brightness",   "range"),
+            ("lane_alpha",       "Lane / beat opacity","range"),
+            ("keybinds",         "Keybinds",           "submenu"),
+        ]
+        self.keybind_index = 0          # selected row in the keybinds screen
+        self.binding_target = None      # lane key currently waiting on a new keypress
         # song-select preview state
         self.sc_scroll = 0.0       # animated carousel offset (pixels)
         self.sc_selected_pull = 0.0  # animated pull-out amount 0..1
@@ -1142,7 +1161,9 @@ class RhythmGame(pyglet.window.Window):
         self.score = 0
         self.combo = 0
         self.max_combo = 0
-        self.hits = {'perfect': 0, 'good': 0, 'ok': 0, 'miss': 0}
+        self.fc = 0          # current perfect-combo
+        self.max_fc = 0      # longest perfect-combo
+        self.hits = {'perfect': 0, 'good': 0, 'meh': 0, 'miss': 0}
         self.feedback_text = ""
         self.feedback_time = 0
         self.feedback_color = (255,255,255,255)
@@ -1240,6 +1261,8 @@ class RhythmGame(pyglet.window.Window):
         # HUD persistent labels
         self._hud_score_lbl = pyglet.text.Label("", x=16, y=WINDOW_H-16, font_name='Arial', font_size=14, weight='bold', color=(240,240,255,255), anchor_x='left', anchor_y='top')
         self._hud_hits_lbl = pyglet.text.Label("", x=16, y=WINDOW_H-33, font_name='Consolas', font_size=11, color=(180,180,200,255), anchor_x='left', anchor_y='top')
+        self._hud_grade_lbl = pyglet.text.Label("", x=16, y=WINDOW_H-52, font_name='Arial', font_size=16, weight='bold', color=(255,220,120,255), anchor_x='left', anchor_y='top')
+        self._hud_fc_lbl = pyglet.text.Label("", x=16, y=WINDOW_H-70, font_name='Consolas', font_size=10, color=(140,220,255,255), anchor_x='left', anchor_y='top')
         self._hud_time_lbl = pyglet.text.Label("", x=WINDOW_W-12, y=WINDOW_H-18, font_name='Consolas', font_size=10, color=(180,220,255,255), anchor_x='right', anchor_y='top')
         self._hud_mode_lbl = pyglet.text.Label("", x=WINDOW_W-12, y=WINDOW_H-32, font_name='Consolas', font_size=10, color=(150,170,200,255), anchor_x='right', anchor_y='top')
         self._hud_feedback_lbl = pyglet.text.Label("", x=CENTER[0], y=CENTER[1]+110, font_name='Arial', font_size=24, weight='bold', color=(255,255,255,255), anchor_x='center', anchor_y='center')
@@ -1249,6 +1272,10 @@ class RhythmGame(pyglet.window.Window):
         self._hud_top_bar.opacity = 220
         self._hud_prog_bg = pyglet.shapes.Rectangle(0, 6, WINDOW_W, 4, color=(40,40,50))
         self._hud_prog_fg = pyglet.shapes.Rectangle(0, 6, 0, 4, color=(100,255,160))
+        # score meter (top-left): thin bar under the score text tracking score / max_score
+        self._hud_meter_bg = pyglet.shapes.Rectangle(16, WINDOW_H-96, 220, 8, color=(30,30,45))
+        self._hud_meter_fg = pyglet.shapes.Rectangle(16, WINDOW_H-96, 0, 8, color=(120,220,140))
+        self._hud_meter_fg.visible = False
 
         # ---- persistent menu shapes for 60fps ----
         self._menu_batch = pyglet.graphics.Batch()
@@ -1329,8 +1356,18 @@ class RhythmGame(pyglet.window.Window):
                 import json as _js
                 data = _js.load(open(self._config_path, encoding='utf-8'))
                 if isinstance(data, dict):
-                    if "fullscreen" in data:
-                        self.settings["fullscreen"] = bool(data.get("fullscreen"))
+                    # apply saved keys where present, keeping defaults otherwise
+                    for k, default in self.settings.items():
+                        if k in data and data[k] is not None:
+                            self.settings[k] = data[k]
+                    if "keybinds" in data:
+                        self._apply_keybinds(data["keybinds"])
+        except Exception:
+            pass
+        # keep live beat offset in sync after load (only if it already exists)
+        try:
+            if hasattr(self, 'beat_offset'):
+                self.beat_offset = float(self.settings.get("input_latency", 0.0))
         except Exception:
             pass
 
@@ -1350,6 +1387,112 @@ class RhythmGame(pyglet.window.Window):
         except Exception:
             pass
         self._save_config()
+
+    # ---- extended settings helpers ----
+    _RANGE_CFG = {
+        "input_latency":    (None, None, 0.01),   # (min, max, step); None = clamp
+        "music_volume":     (0.0, 1.0, 0.05),
+        "fx_volume":        (0.0, 1.0, 0.05),
+        "video_brightness": (0.0, 1.0, 0.05),
+        "lane_alpha":       (0.2, 1.0, 0.05),
+    }
+
+    def _toggle_setting(self, keyname):
+        if keyname == "fullscreen":
+            self._apply_fullscreen(not self.is_fullscreen)
+            return
+        cur = bool(self.settings.get(keyname, False))
+        self.settings[keyname] = not cur
+        self._save_config()
+
+    def _adjust_range_setting(self, keyname, direction):
+        mini, maxi, step = self._RANGE_CFG.get(keyname, (None, None, 0.05))
+        cur = float(self.settings.get(keyname, 0.0))
+        if keyname == "input_latency":
+            # step = 1ms
+            cur = round(cur + direction * 0.01, 3)
+            cur = max(-0.20, min(0.20, cur))
+            self.settings[keyname] = cur
+            self.beat_offset = cur
+        else:
+            cur = round(cur + direction * step, 2)
+            if mini is not None:
+                cur = max(mini, cur)
+            if maxi is not None:
+                cur = min(maxi, cur)
+            self.settings[keyname] = cur
+        self._save_config()
+        self._apply_settings_to_playback()
+
+    def _apply_settings_to_playback(self):
+        # keep any live players in sync with the current volume settings
+        vol = max(0.0, min(1.0, float(self.settings.get("music_volume", 0.9))))
+        for p in (getattr(self, 'media_player', None), getattr(self, 'preview_player', None)):
+            if p is not None:
+                try:
+                    p.volume = vol
+                except Exception:
+                    pass
+
+    # ---- keybinds ----
+    def _open_keybinds(self):
+        self.keybind_index = 0
+        self.binding_target = None
+        self.state = "keybinds"
+
+    def _assign_keybind(self, lane, symbol):
+        # refuse ESC/B as a bind (used to cancel)
+        if symbol in (key.ESCAPE, key.B):
+            self.feedback_text = "Keybind cancelled"
+            self.feedback_color = (255, 180, 80, 255)
+            self.feedback_time = time.time()
+            self.binding_target = None
+            return
+        # drop a bind from another lane if this key is already used (avoid duplicates)
+        for other, cfg in LANES.items():
+            if other != lane and cfg.get('key') == symbol:
+                LANES[other]['key'] = None
+        # update the lane mapping and persist
+        key_name = key.symbol_string(symbol) if hasattr(key, 'symbol_string') else str(symbol)
+        LANES[lane]['key'] = symbol
+        LANES[lane]['label'] = key_name
+        self._rebuild_key_to_lane()
+        self.binding_target = None
+        self.feedback_text = f"{lane.upper()} -> {key_name}"
+        self.feedback_color = (120, 255, 160, 255)
+        self.feedback_time = time.time()
+        self._save_keybinds()
+
+    def _rebuild_key_to_lane(self):
+        global KEY_TO_LANE
+        new_map = {}
+        for k, cfg in LANES.items():
+            if cfg.get('key') is not None:
+                new_map[cfg['key']] = k
+        KEY_TO_LANE = new_map
+
+    def _save_keybinds(self):
+        try:
+            self.settings["keybinds"] = {
+                k: (cfg.get('key'), cfg.get('label')) for k, cfg in LANES.items()
+            }
+            self._save_config()
+        except Exception:
+            pass
+
+    def _apply_keybinds(self, data):
+        # restore lane key+label from saved config
+        if not isinstance(data, dict):
+            return
+        for lane, val in data.items():
+            if lane in LANES and isinstance(val, (list, tuple)) and len(val) == 2:
+                ksym, label = val
+                if isinstance(ksym, int) and ksym > 0:
+                    LANES[lane]['key'] = ksym
+                    if isinstance(label, str) and label:
+                        LANES[lane]['label'] = label
+        self._rebuild_key_to_lane()
+
 
     def _load_song_colors(self):
         try:
@@ -1465,7 +1608,7 @@ class RhythmGame(pyglet.window.Window):
             self.preview_source = src
             self.preview_player = pyglet.media.Player()
             self.preview_player.queue(src)
-            self.preview_player.volume = 0.35
+            self.preview_player.volume = max(0.0, min(1.0, float(self.settings.get("music_volume", 0.9)))) * 0.5
             try:
                 dur = float(src.duration) if src.duration else 30.0
                 self._preview_seek = min(max(dur * 0.3, 0.0), max(0.0, dur - 3.0))
@@ -1579,7 +1722,9 @@ class RhythmGame(pyglet.window.Window):
         self.score = 0
         self.combo = 0
         self.max_combo = 0
-        self.hits = {'perfect': 0, 'good': 0, 'ok': 0, 'miss': 0}
+        self.fc = 0
+        self.max_fc = 0
+        self.hits = {'perfect': 0, 'good': 0, 'meh': 0, 'miss': 0}
         self.start_time = None
         self.is_playing = False
         self.hit_pulse = 0
@@ -1804,9 +1949,15 @@ class RhythmGame(pyglet.window.Window):
         self.is_playing = True
         self.state = "playing"
         self.start_time = time.time()
+        # apply persisted input latency to note timing
+        try:
+            self.beat_offset = float(self.settings.get("input_latency", 0.0))
+        except Exception:
+            pass
         if self.media_player:
             try:
                 self.media_player.seek(0)
+                self.media_player.volume = max(0.0, min(1.0, float(self.settings.get("music_volume", 0.9))))
                 self.media_player.play()
                 self.start_time = time.time()
             except Exception as e:
@@ -1927,6 +2078,7 @@ class RhythmGame(pyglet.window.Window):
             if not b['hit'] and delta > HIT_WINDOW_OK:
                 self.hits['miss'] += 1
                 self.combo = 0
+                self._break_fc()
                 # don't overwrite a recent hit's feedback (e.g., PERFECT) immediately
                 if time.time() - self.feedback_time > 0.35 or self.feedback_text == "MISS":
                     self.feedback_text = "MISS"
@@ -1966,10 +2118,30 @@ class RhythmGame(pyglet.window.Window):
             self.feedback_time = time.time()
             self.set_caption("Radial Rhythm - Results")
 
+    def _play_clickfx(self):
+        # play the keypress SFX - fires on EVERY lane key press during a song
+        try:
+            if getattr(self, '_clickfx_src', None) is None:
+                p = Path(__file__).resolve().parent / "SFX" / "clickfx.mp3"
+                if not p.exists():
+                    return
+                self._clickfx_src = pyglet.media.load(str(p), streaming=False)
+            src = self._clickfx_src
+            if src is None:
+                return
+            pl = pyglet.media.Player()
+            pl.queue(src)
+            pl.volume = max(0.0, min(1.0, float(self.settings.get("fx_volume", 0.7))))
+            pl.play()
+        except Exception:
+            pass
+
     def try_hit(self, lane_char):
         if self.state != "playing" or not self.is_playing:
             self.lane_flash[lane_char] = 1.0
             return
+        # keypress SFX always plays for this lane press (hit or not)
+        self._play_clickfx()
         song_t = self.get_song_time()
         best = None
         best_delta = 999
@@ -1982,6 +2154,7 @@ class RhythmGame(pyglet.window.Window):
                 best = b
         if best is None:
             self.combo = max(0, self.combo - 1)
+            self._break_fc()
             self.feedback_text = "MISS"
             self.feedback_color = (255, 120, 80, 255)
             self.feedback_time = time.time()
@@ -1990,22 +2163,26 @@ class RhythmGame(pyglet.window.Window):
         if best_delta <= HIT_WINDOW_PERFECT:
             pts = 300
             self.hits['perfect'] += 1
+            self.fc += 1
+            self.max_fc = max(self.max_fc, self.fc)
             self.feedback_text = "PERFECT!"
             self.feedback_color = (255, 240, 80, 255)
         elif best_delta <= HIT_WINDOW_GOOD:
-            pts = 150
+            pts = 200
             self.hits['good'] += 1
+            self._break_fc()
             self.feedback_text = "GOOD"
             self.feedback_color = (100, 255, 150, 255)
         elif best_delta <= HIT_WINDOW_OK:
-            pts = 50
-            self.hits['ok'] += 1
-            self.feedback_text = "OK"
+            pts = 100
+            self.hits['meh'] += 1
+            self._break_fc()
+            self.feedback_text = "MEH"
             self.feedback_color = (100, 200, 255, 255)
         else:
             # too far - don't double-count miss (update will count timeout)
-            # just show MISS feedback without incrementing miss yet
             self.combo = max(0, self.combo - 1)
+            self._break_fc()
             self.feedback_text = "MISS"
             self.feedback_color = (255, 80, 80, 255)
             self.feedback_time = time.time()
@@ -2019,6 +2196,35 @@ class RhythmGame(pyglet.window.Window):
         self.feedback_time = time.time()
         self.lane_flash[lane_char] = 1.2
         self.hit_pulse = 1.0
+
+    def _break_fc(self):
+        # any non-perfect hit breaks the perfect combo (FC)
+        self.fc = 0
+
+    def _max_possible_score(self):
+        # theoretical maximum if every beat is a PERFECT hit (300 pts) with the
+        # running combo multiplier applied, modelled the same way try_hit scores.
+        score = 0
+        combo = 0
+        n = len(self.beatmap)
+        for _ in range(n):
+            mult = 1 + min(combo // 8, 4) * 0.25
+            score += int(300 * mult)
+            combo += 1
+        return score or 1
+
+    def _score_pct(self):
+        return (self.score / self._max_possible_score()) * 100.0 if self._max_possible_score() > 0 else 0.0
+
+    def grade(self):
+        pct = self._score_pct()
+        if pct >= 90.0:
+            return "A", pct
+        if pct >= 70.0:
+            return "B", pct
+        if pct >= 50.0:
+            return "C", pct
+        return "D", pct
 
     # --------------------------------------------------------
     # Input
@@ -2079,13 +2285,49 @@ class RhythmGame(pyglet.window.Window):
             if symbol in (key.DOWN, key.S):
                 self.settings_index = (self.settings_index + 1) % nrows
                 return
-            if symbol in (key.LEFT, key.A, key.RIGHT, key.D, key.ENTER, key.SPACE, key.NUM_ENTER):
-                keyname = self.settings_rows[self.settings_index][0]
-                if keyname == "fullscreen":
-                    self._apply_fullscreen(not self.is_fullscreen)
+            keyname = self.settings_rows[self.settings_index][0]
+            row_type = self.settings_rows[self.settings_index][2] if len(self.settings_rows[self.settings_index]) > 2 else "toggle"
+            if symbol in (key.ENTER, key.SPACE, key.NUM_ENTER):
+                # ENTER: toggle toggles, submenu opens
+                if row_type == "toggle":
+                    self._toggle_setting(keyname)
+                elif row_type == "submenu":
+                    if keyname == "keybinds":
+                        self._open_keybinds()
                 return
+            if row_type == "toggle":
+                if symbol in (key.LEFT, key.A, key.RIGHT, key.D):
+                    self._toggle_setting(keyname)
+                    return
+            elif row_type == "range":
+                # LEFT/A decrease, RIGHT/D increase
+                if symbol in (key.LEFT, key.A):
+                    self._adjust_range_setting(keyname, -1)
+                    return
+                if symbol in (key.RIGHT, key.D):
+                    self._adjust_range_setting(keyname, +1)
+                    return
             if symbol in (key.ESCAPE, key.B):
                 self.state = "menu"
+                return
+
+        elif self.state == "keybinds":
+            if getattr(self, 'binding_target', None) is not None:
+                # capture a fresh key for the currently selected lane bind
+                self._assign_keybind(self.binding_target, symbol)
+                return
+            if symbol in (key.UP, key.W):
+                self.keybind_index = (self.keybind_index - 1) % 4
+                return
+            if symbol in (key.DOWN, key.S):
+                self.keybind_index = (self.keybind_index + 1) % 4
+                return
+            if symbol in (key.ENTER, key.SPACE, key.NUM_ENTER):
+                self.binding_target = LANE_ORDER[self.keybind_index]
+                return
+            if symbol in (key.ESCAPE, key.B):
+                self.state = "settings"
+                self.settings_index = 0
                 return
 
         elif self.state == "song_select":
@@ -2443,6 +2685,7 @@ class RhythmGame(pyglet.window.Window):
         segs = slot['ghost']
         cx, cy = CENTER
         n = len(segs) + 1
+        la = max(0.2, min(1.0, float(getattr(self, '_lane_alpha_mult', 0.85))))
         prev = self._spiral_xy(cx, cy, b, 0.0)
         for i in range(len(segs)):
             q = (i + 1) / (n - 1)
@@ -2451,6 +2694,10 @@ class RhythmGame(pyglet.window.Window):
             ln.x = prev[0]; ln.y = prev[1]
             ln.x2 = x; ln.y2 = y
             ln.visible = True
+            try:
+                ln.opacity = int(90 * la)
+            except Exception:
+                pass
             prev = (x, y)
 
     def _hide_beat_slot(self, slot):
@@ -2463,6 +2710,9 @@ class RhythmGame(pyglet.window.Window):
 
     def _draw_beats(self, song_t):
         cx, cy = CENTER
+        # lane/beat transparency (0..1) scales note opacity
+        la = max(0.2, min(1.0, float(self.settings.get("lane_alpha", 0.85))))
+        self._lane_alpha_mult = la
         # Visible toggle is faster than opacity 0 (batch skips invisible)
         # Hide unused from previous frame only
         prev_count = getattr(self, '_beat_last_count', 0)
@@ -2491,7 +2741,7 @@ class RhythmGame(pyglet.window.Window):
                 # dim to grey-ish for miss fade
                 dim_col = tuple(int(c*0.45 + 45) for c in col)
                 circ.x = x; circ.y = y; circ.radius = sz; circ.color = dim_col
-                circ.opacity = max(0, alpha)
+                circ.opacity = max(0, int(alpha * la))
                 circ.visible = True
                 inner_c.visible = False
                 tail.visible = False
@@ -2515,7 +2765,7 @@ class RhythmGame(pyglet.window.Window):
                 sz = 28 * (1 - prog*0.6)
                 col = LANES[b['lane']]['color']
                 hit_circ.x = x; hit_circ.y = y; hit_circ.radius = sz; hit_circ.color = col
-                hit_circ.opacity = max(0, alpha)
+                hit_circ.opacity = max(0, int(alpha * la))
                 hit_circ.visible = True
                 circ.visible = False
                 inner_c.visible = False
@@ -2541,7 +2791,7 @@ class RhythmGame(pyglet.window.Window):
             # tail hidden for 60fps (saves 1 shape per beat)
             tail.visible = False
             circ.x = x; circ.y = y; circ.radius = sz; circ.color = col
-            circ.opacity = 255
+            circ.opacity = int(255 * la)
             circ.visible = True
             inner_c.visible = False
             hit_circ.visible = False
@@ -2576,10 +2826,36 @@ class RhythmGame(pyglet.window.Window):
         if self._hud_score_lbl.text != new_score:
             self._hud_score_lbl.text = new_score
         self._hud_score_lbl.draw()
-        new_hits = f"P:{self.hits['perfect']}  G:{self.hits['good']}  OK:{self.hits['ok']}  M:{self.hits['miss']}"
+        new_hits = f"P:{self.hits['perfect']}  G:{self.hits['good']}  MEH:{self.hits['meh']}  M:{self.hits['miss']}"
         if self._hud_hits_lbl.text != new_hits:
             self._hud_hits_lbl.text = new_hits
         self._hud_hits_lbl.draw()
+        # score meter (top-left) showing score toward the max attainable score
+        mx = self._max_possible_score()
+        pct = max(0.0, min(1.0, (self.score / mx) if mx > 0 else 0.0))
+        mw = int(220 * pct)
+        self._hud_meter_bg.y = self.height - 96
+        self._hud_meter_bg.width = 220
+        self._hud_meter_bg.draw()
+        if mw > 0:
+            self._hud_meter_fg.y = self.height - 96
+            self._hud_meter_fg.width = mw
+            self._hud_meter_fg.visible = True
+            self._hud_meter_fg.draw()
+        # live grade + perfect combo
+        gr, _ = self.grade()
+        gr_col = {'A': (120, 255, 150), 'B': (140, 220, 255), 'C': (255, 220, 120), 'D': (255, 130, 130)}.get(gr, (255,255,255))
+        self._hud_grade_lbl.y = self.height - 112
+        gradetxt = f"Grade {gr}"
+        if self._hud_grade_lbl.text != gradetxt:
+            self._hud_grade_lbl.text = gradetxt
+        self._hud_grade_lbl.color = (*gr_col, 255)
+        self._hud_grade_lbl.draw()
+        self._hud_fc_lbl.y = self.height - 130
+        fctxt = f"Perfect combo x{self.fc}"
+        if self._hud_fc_lbl.text != fctxt:
+            self._hud_fc_lbl.text = fctxt
+        self._hud_fc_lbl.draw()
         if self.is_playing:
             prog = song_t / self.duration if self.duration else 0
             prog = max(0, min(1, prog))
@@ -2660,30 +2936,72 @@ class RhythmGame(pyglet.window.Window):
             new_h = tex.height * scale
             self._video_sprite.x = (self.width - new_w) // 2
             self._video_sprite.y = (self.height - new_h) // 2
-            self._video_sprite.opacity = 110  # dim so game visible
+            # video brightness drives sprite opacity + overlay darkness (0..1, higher = brighter)
+            brt = max(0.0, min(1.0, float(self.settings.get("video_brightness", 0.30))))
+            self._video_sprite.opacity = int(60 + brt * 170)   # 60..230
             self._video_sprite.draw()
-            # dim overlay for readability
+            # dim overlay for readability (brighter video => lighter dim)
             S = self._shapes
             S.reset()
-            S.rect(0, 0, self.width, self.height, (6, 6, 14), radius=0, opacity=140)
+            S.rect(0, 0, self.width, self.height, (6, 6, 14), radius=0, opacity=int(200 - brt * 160))
             S.draw()
             return True
         except Exception as e:
             # fallback blit
             try:
                 tex.blit(0, 0, width=self.width, height=self.height)
+                brt = max(0.0, min(1.0, float(self.settings.get("video_brightness", 0.30))))
                 S = self._shapes
                 S.reset()
-                S.rect(0, 0, self.width, self.height, (6, 6, 14), radius=0, opacity=140)
+                S.rect(0, 0, self.width, self.height, (6, 6, 14), radius=0, opacity=int(200 - brt * 160))
                 S.draw()
                 return True
             except:
                 return False
 
+    # --------------------------------------------------------
+    # Static menu background (Backgrounds/bg01.jpeg)
+    # --------------------------------------------------------
+    def _draw_background(self):
+        # Load bg image lazily (once), then draw it scaled to cover the window,
+        # dimmed so the UI stays readable.
+        try:
+            if not hasattr(self, '_bg_sprite') or self._bg_sprite is None:
+                cand = Path(__file__).resolve().parent / "Backgrounds" / "bg01.jpeg"
+                if not cand.exists():
+                    # try any image in Backgrounds/ as a fallback
+                    bgd = Path(__file__).resolve().parent / "Backgrounds"
+                    if bgd.is_dir():
+                        files = sorted(list(bgd.glob("*.jpeg")) + list(bgd.glob("*.jpg")) + list(bgd.glob("*.png")))
+                        cand = files[0] if files else None
+                if cand is None:
+                    return False
+                img = pyglet.image.load(str(cand))
+                self._bg_texture = img
+                self._bg_sprite = pyglet.sprite.Sprite(img)
+                self._bg_sprite.opacity = 130
+            spr = self._bg_sprite
+            timg = self._bg_texture
+            base_w = getattr(timg, 'width', spr.width)
+            base_h = getattr(timg, 'height', spr.height)
+            scale = max(self.width / max(base_w, 1), self.height / max(base_h, 1))
+            spr.scale = scale
+            new_w = base_w * scale
+            new_h = base_h * scale
+            spr.x = (self.width - new_w) // 2
+            spr.y = (self.height - new_h) // 2
+            spr.draw()
+            return True
+        except Exception:
+            return False
+
     def on_draw(self):
         self.clear()
         # dynamic center for fullscreen
         cx, cy = self.width // 2, self.height // 2
+        # static menu background in every menu EXCEPT song select and gameplay
+        if self.state in ("menu", "settings", "keybinds", "difficulty_select", "analyzing"):
+            self._draw_background()
         # also handle video background scaling via self.width/height
         if self.state in ("playing", "paused", "results"):
             # video background for MP4 (behind everything)
@@ -2727,15 +3045,19 @@ class RhythmGame(pyglet.window.Window):
                 S.draw()
                 # title
                 self._draw_label("RESULTS", x=WINDOW_W//2, y=card_y+card_h-40, size=22, color=(255,255,120,255), anchor_x='center', anchor_y='center', weight='bold')
-                self._draw_label(f"Score  {self.score:06d}", x=WINDOW_W//2, y=card_y+card_h-90, size=18, color=(255,255,255,255), anchor_x='center', anchor_y='center', weight='bold')
-                self._draw_label(f"Max Combo  x{self.max_combo}    Combo {self.combo}", x=WINDOW_W//2, y=card_y+card_h-120, size=12, color=(180,220,255,255), anchor_x='center', anchor_y='center', font_name='Consolas')
+                # grade + score
+                gr, pct = self.grade()
+                gr_col = {'A': (120, 255, 150), 'B': (140, 220, 255), 'C': (255, 220, 120), 'D': (255, 130, 130)}.get(gr, (255,255,255))
+                self._draw_label(f"Grade {gr}", x=WINDOW_W//2, y=card_y+card_h-78, size=26, color=(*gr_col,255), anchor_x='center', anchor_y='center', weight='bold')
+                self._draw_label(f"Score  {self.score:06d}    {pct:.0f}% of max", x=WINDOW_W//2, y=card_y+card_h-110, size=15, color=(255,255,255,255), anchor_x='center', anchor_y='center', weight='bold')
+                self._draw_label(f"Max Combo  x{self.max_combo}    Perfect Combo  x{self.max_fc}", x=WINDOW_W//2, y=card_y+card_h-136, size=12, color=(180,220,255,255), anchor_x='center', anchor_y='center', font_name='Consolas')
                 # hits breakdown
                 total = sum(self.hits.values()) or 1
-                acc = (self.hits['perfect']*1.0 + self.hits['good']*0.7 + self.hits['ok']*0.4) / total * 100
-                self._draw_label(f"PERFECT {self.hits['perfect']}   GOOD {self.hits['good']}   OK {self.hits['ok']}   MISS {self.hits['miss']}", x=WINDOW_W//2, y=card_y+card_h-160, size=11, color=(220,220,240,255), anchor_x='center', anchor_y='center', font_name='Consolas')
-                self._draw_label(f"Accuracy  {acc:.1f}%", x=WINDOW_W//2, y=card_y+card_h-190, size=14, color=(120,255,150,255), anchor_x='center', anchor_y='center', weight='bold')
+                acc = (self.hits['perfect']*1.0 + self.hits['good']*0.85 + self.hits['meh']*0.6) / total * 100
+                self._draw_label(f"PERFECT {self.hits['perfect']}   GOOD {self.hits['good']}   MEH {self.hits['meh']}   MISS {self.hits['miss']}", x=WINDOW_W//2, y=card_y+card_h-170, size=11, color=(220,220,240,255), anchor_x='center', anchor_y='center', font_name='Consolas')
+                self._draw_label(f"Accuracy  {acc:.1f}%", x=WINDOW_W//2, y=card_y+card_h-198, size=14, color=(120,255,150,255), anchor_x='center', anchor_y='center', weight='bold')
                 if self.media_path:
-                    self._draw_label(Path(self.media_path).name, x=WINDOW_W//2, y=card_y+card_h-220, size=9, color=(150,170,200,255), anchor_x='center', anchor_y='center', font_name='Consolas')
+                    self._draw_label(Path(self.media_path).name, x=WINDOW_W//2, y=card_y+card_h-224, size=9, color=(150,170,200,255), anchor_x='center', anchor_y='center', font_name='Consolas')
                 self._draw_label("ENTER / SPACE / ESC : back to menu    R : replay", x=WINDOW_W//2, y=card_y+30, size=10, color=(160,160,190,255), anchor_x='center', anchor_y='center', font_name='Consolas')
                 # still show HUD? not needed
                 return
@@ -2757,7 +3079,7 @@ class RhythmGame(pyglet.window.Window):
             S = self._shapes
             S.reset()
             # dim bg + rounded card
-            S.rect(0, 0, WINDOW_W, WINDOW_H, (10, 10, 18), radius=0)
+            S.rect(0, 0, WINDOW_W, WINDOW_H, (8, 8, 16), radius=0, opacity=175)
             card_w, card_h = 700, 260
             card_x = (WINDOW_W - card_w)//2
             card_y = (WINDOW_H - card_h)//2
@@ -2802,7 +3124,7 @@ class RhythmGame(pyglet.window.Window):
             S = self._shapes
             S.reset()
             # background vignette
-            S.rect(0, 0, self.width, self.height, (8, 8, 16), radius=0)
+            S.rect(0, 0, self.width, self.height, (8, 8, 16), radius=0, opacity=0)
             # faint converging-beat ring motif behind logo (drawn first, under all UI)
             for i, lane in enumerate(LANE_ORDER):
                 col = LANES[lane]['color']
@@ -2888,7 +3210,7 @@ class RhythmGame(pyglet.window.Window):
             scx, scy = self.width // 2, self.height // 2
             S = self._shapes
             S.reset()
-            S.rect(0, 0, self.width, self.height, (8, 8, 16), radius=0)
+            S.rect(0, 0, self.width, self.height, (8, 8, 16), radius=0, opacity=0)
             # faint accent ring motif
             t = time.time()
             for i, lane in enumerate(LANE_ORDER):
@@ -2896,42 +3218,114 @@ class RhythmGame(pyglet.window.Window):
                 cc = pyglet.shapes.Circle(scx, scy + 60, 170 - i * 22, color=col)
                 cc.opacity = int(14 + 10 * (0.5 + 0.5 * math.sin(t * 1.4 + i)))
                 cc.draw()
-            # settings card (rounded)
-            card_w, card_h = 560, 120
-            S.rect(scx - card_w // 2, scy - card_h // 2 - 20, card_w, card_h, (20, 24, 38), radius=16)
-            # rows
+            # layout for a variable number of rows
             nrows = len(self.settings_rows)
-            row_h = 56
-            start_y = scy + 20
-            for i, (keyname, label) in enumerate(self.settings_rows):
-                ry = start_y - i * (row_h + 8)
+            row_pitch = 52
+            list_top = scy + 66
+            card_pad = 24
+            card_top = list_top + card_pad
+            card_bottom = list_top - (nrows - 1) * row_pitch - card_pad
+            card_h = card_top - card_bottom
+            card_w = 600
+            card_x = scx - card_w // 2
+            card_y = card_bottom
+            # settings card (rounded)
+            S.rect(card_x, card_y, card_w, card_h, (20, 24, 38), radius=16)
+            # row boxes (shapes first, under text)
+            for i, row in enumerate(self.settings_rows):
+                ry = list_top - i * row_pitch
                 selected = i == self.settings_index
-                S.rect(scx - card_w // 2 + 24, ry - row_h // 2, card_w - 48, row_h,
+                S.rect(card_x + 24, ry - 21, card_w - 48, 42,
                        (44, 58, 92) if selected else (26, 30, 46), radius=12)
                 if selected:
-                    S.rect(scx - card_w // 2 + 24, ry - row_h // 2, 6, row_h, (100, 255, 160), radius=3)
+                    S.rect(card_x + 24, ry - 21, 6, 42, (100, 255, 160), radius=3)
             # all shapes now, UNDER the text
             S.draw()
 
             # ---- text on top ----
             self._draw_label("SETTINGS", x=scx, y=scy + 190, size=34, color=(255, 255, 255, 255), anchor_x='center', anchor_y='center', weight='bold')
-            for i, (keyname, label) in enumerate(self.settings_rows):
-                ry = start_y - i * (row_h + 8)
+            for i, row in enumerate(self.settings_rows):
+                keyname, label = row[0], row[1]
+                row_type = row[2] if len(row) > 2 else "toggle"
+                ry = list_top - i * row_pitch
                 selected = i == self.settings_index
-                # value for this setting
-                if keyname == "fullscreen":
+                # value for this setting (per row type)
+                if row_type == "toggle":
                     val = "ON" if self.is_fullscreen else "OFF"
-                else:
-                    val = str(self.settings.get(keyname, ""))
-                self._draw_label(label, x=scx - card_w // 2 + 60, y=ry, size=20,
+                    vcol = (140, 230, 160, 255) if val == "ON" else (200, 130, 130, 255)
+                elif row_type == "submenu":
+                    val = "OPEN >"
+                    vcol = (140, 180, 255, 255)
+                else:  # range
+                    if keyname == "input_latency":
+                        ms = int(round(float(self.settings.get(keyname, 0.0)) * 1000.0))
+                        val = f"{ms:+d} ms"
+                        vcol = (180, 200, 230, 255)
+                    else:
+                        pct = int(round(float(self.settings.get(keyname, 0.0)) * 100.0))
+                        val = f"{pct}%"
+                        vcol = (140, 230, 160, 255)
+                self._draw_label(label, x=card_x + 60, y=ry, size=18,
                                  color=(255, 255, 255, 255) if selected else (200, 210, 235, 255),
                                  anchor_x='left', anchor_y='center', weight='bold' if selected else 'normal')
-                self._draw_label(val, x=scx + card_w // 2 - 60, y=ry, size=22,
-                                 color=(140, 230, 160, 255) if val == "ON" else (190, 120, 120, 255),
+                self._draw_label(val, x=card_x + card_w - 40, y=ry, size=18,
+                                 color=vcol,
                                  anchor_x='right', anchor_y='center', weight='bold')
 
-            self._draw_label("UP/DOWN : navigate        ENTER or LEFT/RIGHT : toggle        B / ESC : back", x=scx, y=scy - card_h // 2 - 55, size=10, color=(140, 150, 180, 255), anchor_x='center', anchor_y='center', font_name='Consolas')
-            self._draw_label("(F11 also toggles fullscreen anytime)", x=scx, y=scy - card_h // 2 - 76, size=9, color=(100, 110, 140, 255), anchor_x='center', anchor_y='center', font_name='Consolas')
+            self._draw_label("UP/DOWN : navigate        ENTER / LEFT / RIGHT : change        B / ESC : back", x=scx, y=card_bottom - 14, size=10, color=(140, 150, 180, 255), anchor_x='center', anchor_y='center', font_name='Consolas')
+            self._draw_label("(F11 also toggles fullscreen anytime)", x=scx, y=card_bottom - 34, size=9, color=(100, 110, 140, 255), anchor_x='center', anchor_y='center', font_name='Consolas')
+            return
+
+        if self.state == "keybinds":
+            # ---- keybind remapping screen ----
+            scx, scy = self.width // 2, self.height // 2
+            S = self._shapes
+            S.reset()
+            S.rect(0, 0, self.width, self.height, (8, 8, 16), radius=0, opacity=0)
+            t = time.time()
+            for i, lane in enumerate(LANE_ORDER):
+                col = LANES[lane]['color']
+                cc = pyglet.shapes.Circle(scx, scy + 60, 170 - i * 22, color=col)
+                cc.opacity = int(14 + 10 * (0.5 + 0.5 * math.sin(t * 1.4 + i)))
+                cc.draw()
+            card_w, card_h = 560, 300
+            card_x = (self.width - card_w) // 2
+            card_y = (self.height - card_h) // 2
+            S.rect(card_x, card_y, card_w, card_h, (20, 24, 38), radius=16)
+            lane_rows = []
+            for idxp, lane in enumerate(LANE_ORDER):
+                ry = scy + 20 - idxp * 66
+                cfg = LANES[lane]
+                col = cfg['color']
+                lane_rows.append((lane, ry, cfg, col))
+                selected = idxp == self.keybind_index
+                S.rect(card_x + 30, ry - 26, card_w - 60, 52,
+                       (55, 55, 90) if selected else (28, 28, 42), radius=12)
+                if selected:
+                    S.rect(card_x + 30, ry - 26, 6, 52, (100, 255, 160), radius=3)
+            S.draw()
+            self._draw_label("KEYBINDS", x=scx, y=scy + 185, size=30, color=(255, 255, 255, 255), anchor_x='center', anchor_y='center', weight='bold')
+            for (lane, ry, cfg, col) in lane_rows:
+                selected = lane == self.binding_target or LANE_ORDER.index(lane) == self.keybind_index
+                # lane dot colour chip
+                dot = pyglet.shapes.Circle(card_x + 58, ry, 7, color=col)
+                dot.draw()
+                self._draw_label(lane.upper(), x=card_x + 78, y=ry + 6, size=18, color=(240, 240, 255, 255), anchor_x='left', anchor_y='center', weight='bold')
+                self._draw_label(f"lane {LANE_ORDER.index(lane)+1} of 4", x=card_x + 78, y=ry - 14, size=9, color=(150, 160, 190, 255), anchor_x='left', anchor_y='center', font_name='Consolas')
+                # current key label (right side)
+                klab = cfg.get('label') or "?"
+                if self.binding_target == lane:
+                    ktext = "Press a key..."
+                    kcol = (255, 220, 120, 255)
+                else:
+                    ktext = klab
+                    kcol = (140, 230, 160, 255) if selected else (180, 190, 215, 255)
+                self._draw_label(ktext, x=card_x + card_w - 40, y=ry, size=20, color=kcol, anchor_x='right', anchor_y='center', weight='bold')
+            self._draw_label("UP/DOWN select      ENTER rebind      B / ESC back", x=scx, y=card_y + 24, size=10, color=(140, 150, 180, 255), anchor_x='center', anchor_y='center', font_name='Consolas')
+            if self.feedback_text and (time.time() - self.feedback_time) < 3.0:
+                age = time.time() - self.feedback_time
+                alpha = int(180 * (1 - age/3.0))
+                self._draw_label(self.feedback_text, x=scx, y=card_y - 30, size=10, color=(*self.feedback_color[:3], max(0, alpha)), anchor_x='center', anchor_y='center', font_name='Consolas')
             return
 
         if self.state == "song_select":
@@ -3092,7 +3486,7 @@ class RhythmGame(pyglet.window.Window):
         if self.state == "difficulty_select":
             S = self._shapes
             S.reset()
-            S.rect(0, 0, WINDOW_W, WINDOW_H, (10, 10, 18), radius=0)
+            S.rect(0, 0, WINDOW_W, WINDOW_H, (8, 8, 16), radius=0, opacity=175)
             song_name = Path(self.pending_song_path).name if self.pending_song_path else "Unknown"
             if len(song_name) > 55:
                 song_name = song_name[:52] + "..."
