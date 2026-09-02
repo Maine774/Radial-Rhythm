@@ -1,0 +1,46 @@
+[gd_scene load_steps=2 format=3 uid="uid://d7k2p88901"]
+
+[ext_resource type="Script" path="res://scripts/SongSelect.gd" id="1_sel"]
+
+[node name="SongSelect" type="Control"]
+layout_mode=3
+anchors_preset=15
+anchor_right=1.0
+anchor_bottom=1.0
+grow_horizontal=2
+grow_vertical=2
+script=ExtResource("1_sel")
+
+[node name="Bg" type="ColorRect" parent="."]
+layout_mode=1
+anchors_preset=15
+anchor_right=1.0
+anchor_bottom=1.0
+grow_horizontal=2
+grow_vertical=2
+color=Color(0.0392157, 0.0392157, 0.0705882, 1)
+
+[node name="VBox" type="VBoxContainer" parent="."]
+layout_mode=1
+anchors_preset=15
+anchor_right=1.0
+anchor_bottom=1.0
+grow_horizontal=2
+grow_vertical=2
+alignment=0
+
+[node name="Title" type="Label" parent="VBox"]
+theme_override_font_sizes/font_size=22
+layout_mode=2
+theme_override_colors/font_color=Color(1, 1, 0.47, 1)
+text="SONG SELECT — dN rating + best grade/FC from cache history"
+horizontal_alignment=1
+
+[node name="List" type="VBoxContainer" parent="VBox"]
+layout_mode=2
+
+[node name="Back" type="Button" parent="VBox"]
+layout_mode=2
+text="Back (B / ESC)"
+
+[connection signal="pressed" from="VBox/Back" to="." method="_on_back_pressed"]

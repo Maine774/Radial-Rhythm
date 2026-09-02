@@ -1,0 +1,82 @@
+[gd_scene format=3 uid="uid://c8q3y536a8"]
+
+[ext_resource type="Script" uid="uid://dqwfr15btcpet" path="res://scripts/Main.gd" id="1_rythmn"]
+
+[node name="Main" type="Control" unique_id=738822367]
+layout_mode = 3
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+script = ExtResource("1_rythmn")
+
+[node name="Bg" type="TextureRect" parent="." unique_id=790836428]
+self_modulate = Color(1, 1, 1, 0.85)
+texture_filter = 3
+layout_mode = 1
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+expand_mode = 3
+
+[node name="VBox" type="VBoxContainer" parent="." unique_id=1165850211]
+layout_mode = 1
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+alignment = 1
+
+[node name="Title" type="Label" parent="VBox" unique_id=914648719]
+layout_mode = 2
+theme_override_colors/font_color = Color(1, 1, 1, 1)
+theme_override_font_sizes/font_size = 64
+text = "RADIAL RHYTHM"
+horizontal_alignment = 1
+
+[node name="Subtitle" type="Label" parent="VBox" unique_id=508998996]
+layout_mode = 2
+theme_override_colors/font_color = Color(0.784314, 0.862745, 0.941176, 1)
+theme_override_font_sizes/font_size = 14
+text = "Godot port — Forward+ • 60fps"
+horizontal_alignment = 1
+
+[node name="Menu" type="VBoxContainer" parent="VBox" unique_id=197977718]
+custom_minimum_size = Vector2(420, 0)
+layout_mode = 2
+alignment = 1
+
+[node name="Play" type="Button" parent="VBox/Menu" unique_id=1976810636]
+custom_minimum_size = Vector2(0, 44)
+layout_mode = 2
+text = "PLAY"
+
+[node name="OpenFile" type="Button" parent="VBox/Menu" unique_id=2100272949]
+custom_minimum_size = Vector2(0, 32)
+layout_mode = 2
+text = "OPEN FILE"
+
+[node name="Settings" type="Button" parent="VBox/Menu" unique_id=1569565874]
+custom_minimum_size = Vector2(0, 32)
+layout_mode = 2
+text = "SETTINGS"
+
+[node name="Quit" type="Button" parent="VBox/Menu" unique_id=1566657592]
+custom_minimum_size = Vector2(0, 32)
+layout_mode = 2
+text = "QUIT"
+
+[node name="Hint" type="Label" parent="VBox" unique_id=1634753848]
+layout_mode = 2
+theme_override_colors/font_color = Color(0.588235, 0.627451, 0.705882, 1)
+theme_override_font_sizes/font_size = 10
+text = "Ported from C:/Users/LOK0008/rhythmgame/main.py (~3900 lines) • state machine preserved"
+horizontal_alignment = 1
+
+[connection signal="pressed" from="VBox/Menu/Play" to="." method="_on_Play_pressed"]
+[connection signal="pressed" from="VBox/Menu/Settings" to="." method="_on_Settings_pressed"]
+[connection signal="pressed" from="VBox/Menu/Quit" to="." method="_on_Quit_pressed"]
